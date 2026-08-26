@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 
 
@@ -17,6 +17,9 @@ class RetrievalHit:
     citation_depth: int = 0
     parent_chunk_id: str | None = None
     citation: dict[str, Any] | None = None
+    retrieval_method: str = "semantic"
+    dense_rank: int | None = None
+    lexical_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -26,15 +29,6 @@ class CitationPath:
     reference: dict[str, Any]
     status: str
     target_chunk_ids: list[str]
-
-
-@dataclass(frozen=True)
-class AbbreviationResolution:
-    acronym: str
-    candidates: list[dict[str, Any]]
-    selected_expansion: str | None
-    confidence: float
-    margin: float | None
 
 
 @dataclass(frozen=True)
@@ -48,7 +42,6 @@ class RagResult:
     retrievals: list[RetrievalHit]
     answer: str | None
     citation_paths: list[CitationPath]
-    abbreviation_resolutions: list[AbbreviationResolution] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

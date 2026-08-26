@@ -11,6 +11,19 @@ from typing import Any
 from docx import Document
 
 
+def canonical_document_id(value: str) -> str | None:
+    """Normalize catalog paths and retrieval metadata to one document key."""
+    normalized = value.strip().replace("\\", "/").rstrip("/")
+    if not normalized:
+        return None
+    return normalized.rsplit("/", 1)[-1] or None
+
+
+def canonical_expansion_key(value: str) -> str:
+    """Collapse case, punctuation, and hyphen-only spelling variants."""
+    return " ".join(re.findall(r"[\w]+", value.casefold(), flags=re.UNICODE))
+
+
 @dataclass(frozen=True)
 class AmbiguousAbbreviationCandidate:
     """One Release-18 expansion plus the series in which it is defined."""
@@ -18,6 +31,7 @@ class AmbiguousAbbreviationCandidate:
     expansion: str
     source_series: tuple[str, ...]
     source_count: int
+    source_document_ids: tuple[str, ...] = ()
 
 
 class Vocabulary:
@@ -96,7 +110,7 @@ class Vocabulary:
 
     @staticmethod
     def _parse_candidates(candidates: list[Any]) -> list[AmbiguousAbbreviationCandidate]:
-        parsed: list[AmbiguousAbbreviationCandidate] = []
+        grouped: dict[str, dict[str, Any]] = {}
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
@@ -104,59 +118,56 @@ class Vocabulary:
             sources = candidate.get("sources", [])
             if not isinstance(expansion, str) or not expansion.strip() or not isinstance(sources, list):
                 continue
-            series = tuple(
-                sorted(
-                    {
-                        source["series"]
-                        for source in sources
-                        if isinstance(source, dict) and isinstance(source.get("series"), str)
-                    }
-                )
-            )
-            parsed.append(
-                AmbiguousAbbreviationCandidate(
-                    expansion=expansion.strip(), source_series=series, source_count=len(sources)
-                )
-            )
-        return parsed
-
-    def ambiguous_matches(
-        self, question: str, candidate_limit: int, excluded_acronyms: list[str] | None = None
-    ) -> dict[str, list[AmbiguousAbbreviationCandidate]]:
-        """Return ambiguous acronyms present as standalone question tokens.
-
-        Candidate ordering only controls the runtime cost cap. Series affinity is
-        deliberately not applied here: the first router pass can be wrong.
-        """
-        if candidate_limit < 1:
-            raise ValueError("candidate_limit must be at least 1")
-        excluded = {
-            acronym.casefold()
-            for acronym in (excluded_acronyms or [])
-            if isinstance(acronym, str)
-        }
-        matches: dict[str, list[AmbiguousAbbreviationCandidate]] = {}
-        for word in self._words(question):
-            if word.casefold() in excluded or word in matches or word not in self.ambiguous_abbreviations:
+            cleaned_expansion = expansion.strip()
+            key = canonical_expansion_key(cleaned_expansion)
+            if not key:
                 continue
-            candidates = self.ambiguous_abbreviations[word]
-            matches[word] = sorted(
-                candidates,
-                key=lambda candidate: (-candidate.source_count, candidate.expansion.casefold()),
-            )[:candidate_limit]
-        return matches
+            row = grouped.setdefault(
+                key,
+                {
+                    "expansion": cleaned_expansion,
+                    "representative_source_count": len(sources),
+                    "source_series": set(),
+                    "source_count": 0,
+                    "source_document_ids": set(),
+                },
+            )
+            if len(sources) > row["representative_source_count"]:
+                row["expansion"] = cleaned_expansion
+                row["representative_source_count"] = len(sources)
+            row["source_count"] += len(sources)
+            row["source_series"].update(
+                source["series"]
+                for source in sources
+                if isinstance(source, dict) and isinstance(source.get("series"), str)
+            )
+            row["source_document_ids"].update(
+                document_id
+                for source in sources
+                if isinstance(source, dict)
+                and isinstance(source.get("source_document_key"), str)
+                and (document_id := canonical_document_id(source["source_document_key"])) is not None
+            )
+        return [
+            AmbiguousAbbreviationCandidate(
+                expansion=str(row["expansion"]),
+                source_series=tuple(sorted(row["source_series"])),
+                source_count=int(row["source_count"]),
+                source_document_ids=tuple(sorted(row["source_document_ids"])),
+            )
+            for row in grouped.values()
+        ]
 
-    def enrich(self, question: str, resolved_abbreviations: dict[str, str] | None = None) -> str:
+    def enrich(self, question: str) -> str:
         normalized = re.sub(r"[!()\-\[\]{};:'\"\\,<>./?@#$%^&*_~]", "", question.lower())
         matched_terms = [
             f"{term}: {definition}"
             for term, definition in self.terms.items()
             if re.sub(r"[!()\-\[\]{};:'\"\\,<>./?@#$%^&*_~]", "", term.lower()) in normalized
         ]
-        abbreviations = {**self.abbreviations, **(resolved_abbreviations or {})}
         words = self._words(question)
         matched_abbreviations = [
-            f"{word}: {abbreviations[word]}" for word in words if word in abbreviations
+            f"{word}: {self.abbreviations[word]}" for word in words if word in self.abbreviations
         ]
         terms_text = "\n".join(matched_terms)
         abbreviations_text = "\n".join(matched_abbreviations)

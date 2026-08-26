@@ -6,6 +6,7 @@
 .env
 *.toml
 !/newbaseline/pyproject.toml
+!/newbaseline/config.toml
 /Telco-RAG_api/*
 /Telco-RAG_api/3GPP-Release18/
 /Telco-RAG_api/

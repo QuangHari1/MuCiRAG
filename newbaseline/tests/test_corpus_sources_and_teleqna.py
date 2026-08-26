@@ -42,7 +42,7 @@ class SourceDiscoveryTests(unittest.TestCase):
 
 
 class TeleQnATests(unittest.TestCase):
-    def test_tail_run_defaults_to_baseline_comparison_under_newbaseline_results(self) -> None:
+    def test_tail_run_does_not_compare_unless_requested(self) -> None:
         settings = run_teleqna_benchmark.load_settings()
         with tempfile.TemporaryDirectory() as temporary_directory:
             result_directory = Path(temporary_directory) / "teleqna"
@@ -53,7 +53,7 @@ class TeleQnATests(unittest.TestCase):
                 args = run_teleqna_benchmark.parse_args(settings)
 
         self.assertEqual(args.output, result_directory / "paper-baseline-gsma-rel18-tail200.jsonl")
-        self.assertEqual(args.compare_to, result_directory / "paper-baseline-gsma-rel18.jsonl")
+        self.assertIsNone(args.compare_to)
 
     def test_multiple_choice_prompt_and_answer_scoring(self) -> None:
         record = parse_record(

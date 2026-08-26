@@ -22,6 +22,7 @@ from newbaseline.src.evaluation.teleqna import (
     score_multiple_choice,
 )
 from newbaseline.src.evaluation.tracking import start_experiment_tracker
+from newbaseline.src.rag.corpus import HYBRID_CANDIDATE_MULTIPLIER, HYBRID_RRF_K
 from newbaseline.src.rag.service import PaperRagService
 from newbaseline.src.settings import load_settings
 
@@ -77,14 +78,6 @@ def vocabulary_manifest_config(settings: Any) -> dict[str, Any]:
         "abbreviations": abbreviations_file,
     }
     config: dict[str, Any] = {"vocabulary_mode": settings.get("vocabulary", "mode")}
-    for key in (
-        "contextual_candidate_limit",
-        "contextual_support_top_k",
-        "contextual_min_score",
-        "contextual_min_margin",
-        "contextual_excluded_acronyms",
-    ):
-        config[f"vocabulary_{key}"] = settings.get("vocabulary", key)
     for role, filename in assets.items():
         path = resources / filename
         config[f"vocabulary_{role}_file"] = filename
@@ -94,6 +87,14 @@ def vocabulary_manifest_config(settings: Any) -> dict[str, Any]:
 
 def benchmark_config(settings: Any, args: argparse.Namespace, dataset_path: Path) -> dict[str, Any]:
     """Persist every non-secret setting that can affect a benchmark result."""
+    lexical_index_path = (
+        settings.dataset_dir
+        / "3gpp"
+        / "Embeddings"
+        / f"Rel-{settings.release}"
+        / settings.get("rag", "selection_id")
+        / settings.get("rag", "lexical_index_file")
+    )
     config = {
         "dataset_path": str(dataset_path),
         "dataset_sha256": file_sha256(dataset_path),
@@ -108,13 +109,19 @@ def benchmark_config(settings: Any, args: argparse.Namespace, dataset_path: Path
         "answer_model": settings.get("rag", "answer_model"),
         "router_backend": settings.get("rag", "router_backend"),
         "router_top_k": settings.get("rag", "router_top_k"),
+        "retrieval_backend": settings.get("rag", "retrieval_backend"),
         "retrieval_top_k": settings.get("rag", "retrieval_top_k"),
+        "lexical_index_file": settings.get("rag", "lexical_index_file"),
+        "hybrid_candidate_multiplier": HYBRID_CANDIDATE_MULTIPLIER,
+        "hybrid_rrf_k": HYBRID_RRF_K,
         "citation_max_depth": settings.get("rag", "citation_max_depth"),
         "citation_total_chunks": settings.get("rag", "citation_total_chunks"),
         "citation_chunks_per_heading": settings.get("rag", "citation_chunks_per_heading"),
         "workers": args.workers,
         "limit": args.limit,
     }
+    if config["retrieval_backend"] == "hybrid":
+        config["lexical_index_sha256"] = file_sha256(lexical_index_path)
     config.update(vocabulary_manifest_config(settings))
     return config
 
@@ -212,9 +219,8 @@ def parse_args(settings: Any) -> argparse.Namespace:
     parser.add_argument(
         "--compare-to",
         type=Path,
-        help="Existing benchmark JSONL to compare against (default: the full baseline when output differs).",
+        help="Existing benchmark JSONL to compare against. Comparison is disabled unless this is supplied.",
     )
-    parser.add_argument("--no-compare", action="store_true", help="Do not compare this run to the full baseline.")
     parser.add_argument("--overwrite", action="store_true", help="Discard an existing output checkpoint.")
     parser.add_argument(
         "--workers",
@@ -235,14 +241,10 @@ def parse_args(settings: Any) -> argparse.Namespace:
         parser.error("--progress-every must be positive")
     if args.workers < 1:
         parser.error("--workers must be positive")
-    if args.no_compare and args.compare_to:
-        parser.error("--no-compare cannot be combined with --compare-to")
-
     result_directory = Path(settings.get("evaluation", "teleqna_output_dir"))
     if not result_directory.is_absolute():
         result_directory = NEWBASELINE_ROOT / result_directory
     selection_id = settings.get("rag", "selection_id")
-    baseline_path = result_directory / f"{selection_id}.jsonl"
     if args.output is None:
         if args.limit is not None:
             run_suffix = f"-tail{args.limit}" if args.reverse else f"-head{args.limit}"
@@ -251,10 +253,6 @@ def parse_args(settings: Any) -> argparse.Namespace:
         else:
             run_suffix = ""
         args.output = result_directory / f"{selection_id}{run_suffix}.jsonl"
-    if args.no_compare:
-        args.compare_to = None
-    elif args.compare_to is None and args.output.resolve() != baseline_path.resolve():
-        args.compare_to = baseline_path
     if args.compare_to and not args.compare_to.is_file():
         parser.error(f"--compare-to does not exist: {args.compare_to}")
     return args

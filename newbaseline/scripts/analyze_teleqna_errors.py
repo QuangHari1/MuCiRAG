@@ -108,26 +108,6 @@ def trace_metrics(trace: dict[str, Any]) -> dict[str, Any]:
         for reference in [path.get("reference")]
         if isinstance(reference, dict)
     )
-    abbreviation_resolutions = [
-        resolution
-        for resolution in as_list(trace.get("abbreviation_resolutions"))
-        if isinstance(resolution, dict)
-    ]
-    resolved_abbreviations = [
-        str(resolution["acronym"])
-        for resolution in abbreviation_resolutions
-        if isinstance(resolution.get("acronym"), str) and isinstance(resolution.get("selected_expansion"), str)
-    ]
-    confidences = [
-        confidence
-        for resolution in abbreviation_resolutions
-        if (confidence := as_float(resolution.get("confidence"))) is not None
-    ]
-    margins = [
-        margin
-        for resolution in abbreviation_resolutions
-        if (margin := as_float(resolution.get("margin"))) is not None
-    ]
     return {
         "retrieval_count": len(retrievals),
         "semantic_count": len(semantic),
@@ -149,12 +129,6 @@ def trace_metrics(trace: dict[str, Any]) -> dict[str, Any]:
         "router_selected_series": trace.get("router_selected_series", []),
         "empty_selected_series": trace.get("empty_selected_series", []),
         "searched_series": trace.get("searched_series", []),
-        "ambiguous_abbreviation_count": len(abbreviation_resolutions),
-        "resolved_abbreviation_count": len(resolved_abbreviations),
-        "abstained_abbreviation_count": len(abbreviation_resolutions) - len(resolved_abbreviations),
-        "resolved_abbreviations": resolved_abbreviations,
-        "abbreviation_mean_confidence": safe_mean(confidences),
-        "abbreviation_min_margin": min(margins, default=None),
     }
 
 
@@ -373,27 +347,6 @@ def path_status_by_outcome(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def abbreviation_summary_by_outcome(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    summary: list[dict[str, Any]] = []
-    for status in ("correct", "wrong", "unscored"):
-        group = [row for row in rows if row["status"] == status]
-        summary.append(
-            {
-                "status": status,
-                "questions": len(group),
-                "ambiguous_mentions": sum(row["ambiguous_abbreviation_count"] for row in group),
-                "resolved": sum(row["resolved_abbreviation_count"] for row in group),
-                "abstained": sum(row["abstained_abbreviation_count"] for row in group),
-                "mean_confidence": safe_mean(
-                    row["abbreviation_mean_confidence"]
-                    for row in group
-                    if row["abbreviation_mean_confidence"] is not None
-                ),
-            }
-        )
-    return summary
-
-
 def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
     with path.open("w", encoding="utf-8", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=fields)
@@ -427,6 +380,9 @@ def retrieval_rows(rows: list[dict[str, Any]], result_rows: dict[str, dict[str, 
                     "overall_rank": rank,
                     "origin_rank": origin_ranks[origin],
                     "origin": origin,
+                    "retrieval_method": retrieval.get("retrieval_method", "semantic"),
+                    "dense_rank": retrieval.get("dense_rank"),
+                    "lexical_rank": retrieval.get("lexical_rank"),
                     "score": retrieval.get("score"),
                     "series": retrieval.get("series"),
                     "document_key": retrieval.get("document_key"),
@@ -462,30 +418,6 @@ def citation_path_rows(rows: list[dict[str, Any]], result_rows: dict[str, dict[s
                     "target_document_id": reference.get("document_id"),
                     "target_heading": reference.get("target_heading"),
                     "target_chunk_ids": path.get("target_chunk_ids", []),
-                }
-            )
-    return flattened
-
-
-def abbreviation_resolution_rows(rows: list[dict[str, Any]], result_rows: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    by_id = {row["question_id"]: row for row in rows}
-    flattened: list[dict[str, Any]] = []
-    for question_id, result in result_rows.items():
-        trace = result.get("trace") if isinstance(result.get("trace"), dict) else {}
-        for resolution in as_list(trace.get("abbreviation_resolutions")):
-            if not isinstance(resolution, dict):
-                continue
-            row = by_id[question_id]
-            flattened.append(
-                {
-                    "question_id": question_id,
-                    "status": row["status"],
-                    "question_release": row["question_release"],
-                    "acronym": resolution.get("acronym"),
-                    "selected_expansion": resolution.get("selected_expansion"),
-                    "confidence": resolution.get("confidence"),
-                    "margin": resolution.get("margin"),
-                    "candidates": resolution.get("candidates", []),
                 }
             )
     return flattened
@@ -538,7 +470,6 @@ def analyze(results_path: Path, dataset_path: Path, output_dir: Path, corpus_rel
         "by_citation_count": group_summary(rows, "citation_count"),
         "router_series": router_series_summary(rows),
         "citation_path_status_by_outcome": path_status_by_outcome(rows),
-        "abbreviation_resolution_by_outcome": abbreviation_summary_by_outcome(rows),
     }
 
     question_fields = [
@@ -547,8 +478,6 @@ def analyze(results_path: Path, dataset_path: Path, output_dir: Path, corpus_rel
         "retrieval_count", "semantic_count", "citation_count", "semantic_top1_score", "semantic_mean_score",
         "semantic_score_spread", "citation_top1_score", "citation_mean_score", "citation_vs_semantic_top1",
         "citation_path_count", "citation_path_statuses", "citation_depths", "citation_reference_types",
-        "ambiguous_abbreviation_count", "resolved_abbreviation_count", "abstained_abbreviation_count",
-        "resolved_abbreviations", "abbreviation_mean_confidence", "abbreviation_min_margin",
         "router_selected_series", "empty_selected_series", "searched_series", "diagnostic_flags",
     ]
     write_csv(output_dir / "questions.csv", rows, question_fields)
@@ -556,17 +485,12 @@ def analyze(results_path: Path, dataset_path: Path, output_dir: Path, corpus_rel
     write_csv(
         output_dir / "retrievals.csv",
         retrieval_rows(rows, result_rows),
-        ["question_id", "status", "question_release", "overall_rank", "origin_rank", "origin", "score", "series", "document_key", "heading", "chunk_id", "citation_depth", "parent_chunk_id"],
+        ["question_id", "status", "question_release", "overall_rank", "origin_rank", "origin", "retrieval_method", "dense_rank", "lexical_rank", "score", "series", "document_key", "heading", "chunk_id", "citation_depth", "parent_chunk_id"],
     )
     write_csv(
         output_dir / "citation_paths.csv",
         citation_path_rows(rows, result_rows),
         ["question_id", "status", "question_release", "depth", "path_status", "parent_chunk_id", "reference_type", "target_series", "target_document_id", "target_heading", "target_chunk_ids"],
-    )
-    write_csv(
-        output_dir / "abbreviation_resolutions.csv",
-        abbreviation_resolution_rows(rows, result_rows),
-        ["question_id", "status", "question_release", "acronym", "selected_expansion", "confidence", "margin", "candidates"],
     )
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -650,20 +574,6 @@ def analyze(results_path: Path, dataset_path: Path, output_dir: Path, corpus_rel
             ],
         ),
         "`citation_paths.csv` contains the parent chunk, target document/heading, reference type and selected target IDs. `retrievals.csv` contains every selected seed/citation chunk and its score.",
-        "",
-        "## Ambiguous abbreviation resolver",
-        "",
-        markdown_table(
-            ["outcome", "questions", "ambiguous mentions", "resolved", "abstained", "mean confidence"],
-            [
-                [
-                    row["status"], str(row["questions"]), str(row["ambiguous_mentions"]),
-                    str(row["resolved"]), str(row["abstained"]), round_or_blank(row["mean_confidence"]),
-                ]
-                for row in summary["abbreviation_resolution_by_outcome"]
-            ],
-        ),
-        "`abbreviation_resolutions.csv` gives every candidate score, provenance-series prior, winning expansion, confidence, and margin. Empty output for an older run means the contextual resolver was not enabled.",
         "",
         "## Wrong-answer diagnostic flags",
         "",

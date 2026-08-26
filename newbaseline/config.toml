@@ -1,0 +1,97 @@
+[paths]
+dataset_dir = "dataset"
+
+[corpus]
+release = "18"
+
+[gsma]
+repository = "GSMA/3GPP"
+revision = "a056f6018a7e8e67052aa68a702e272d0ae95d75"
+raw_markdown_glob = "marked/Rel-18/**/raw.md"
+expected_raw_markdown_files = 1345
+
+[paper]
+repository = "netop/Embeddings3GPP-R18"
+revision = "b8d598e50cada8aaa4de641abbec77bef6b51839"
+expected_document_files = 553
+paper_selection_id = "paper-baseline-gsma-rel18"
+full_selection_id = "full-gsma-rel18"
+
+[paper_release_summaries]
+source_dir = "dataset/3gpp/paper_release_summaries/source/Documents"
+chunk_file = "ChunkReleaseSummaries.json"
+source_releases = ["14", "15", "16", "17"]
+
+[teleqna]
+repository = "netop/TeleQnA"
+revision = "0eba715a43f0ab7e4d9d7e09ceb258642a149391"
+include_file = "TeleQnA.json"
+release_tag_pattern = "[3GPP Release \\d+]"
+
+[chunking]
+preferred_source_name = "raw_image_table_verbalized.md"
+fallback_source_name = "raw.md"
+target_tokens = 250
+max_tokens = 300
+characters_per_token = 4
+
+[embedding]
+backend = "openai"
+model = "text-embedding-3-large"
+dimensions = 1024
+normalize = false
+batch_size = 128
+max_retries = 6
+
+[llm]
+provider = "openai"
+api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+thinking_mode = "disabled"
+temperature = 0.0
+
+#provider = "deepseek"
+#api_key_env = "DEEPSEEK_API_KEY"
+#base_url = "https://api.deepseek.com"
+#thinking_mode = "disabled"
+
+[rag]
+resources_dir = "newbaseline/resources"
+router_checkpoint = "router_new.pth"
+series_descriptions = "series_description.json"
+vocabulary = "3GPP_vocabulary.docx"
+selection_id = "paper-baseline-gsma-rel18"
+
+rephrase_model = "gpt-4o-mini"
+answer_model = "gpt-4o-mini"
+router_top_k = 5
+retrieval_top_k = 8
+retrieval_backend = "hybrid"
+lexical_index_file = "lexical.sqlite3"
+router_similarity_scale = 10.0
+router_backend = "paper_nn"
+citation_max_depth = 0
+citation_total_chunks = 8
+citation_chunks_per_heading = 1
+
+[vocabulary]
+
+#mode = "paper_legacy"
+mode = "release18_unambiguous"
+definitions_file = "3GPP_definitions_paper_v17.json"
+abbreviations_file = "3GPP_vocabulary_release18.json"
+
+[evaluation]
+teleqna_output_dir = "results/teleqna"
+progress_every = 10
+
+[experiment_tracking]
+# MLflow uses a local SQLite store plus local artifacts; no account or cloud upload.
+# Use "disabled" to skip tracking entirely.
+mode = "mlflow"
+experiment_name = "telco-rag"
+tracking_directory = "newbaseline/results/mlflow"
+
+[runtime]
+download_progress_seconds = 10
+http_timeout_seconds = 90

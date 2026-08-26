@@ -7,11 +7,30 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from newbaseline.src.rag.vocabulary import AmbiguousAbbreviationCandidate, Vocabulary
+from newbaseline.src.rag.vocabulary import Vocabulary
 
 
 class VocabularyAssetsTests(unittest.TestCase):
-    def test_release18_assets_keep_terms_and_abstain_for_ambiguous_acronyms(self) -> None:
+    def test_spelling_only_expansion_aliases_are_merged_before_ambiguity_check(self) -> None:
+        candidates = Vocabulary._parse_candidates(
+            [
+                {
+                    "expansion": "Long-Term Evolution",
+                    "sources": [{"series": "23", "source_document_key": "23_series/23001"}],
+                },
+                {
+                    "expansion": "long term evolution",
+                    "sources": [{"series": "36", "source_document_key": "36_series/36001"}],
+                },
+            ]
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source_count, 2)
+        self.assertEqual(candidates[0].source_series, ("23", "36"))
+        self.assertEqual(candidates[0].source_document_ids, ("23001", "36001"))
+
+    def test_release18_assets_keep_ambiguous_acronyms_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             definitions = root / "definitions.json"
@@ -26,8 +45,14 @@ class VocabularyAssetsTests(unittest.TestCase):
                         "acronyms": {
                             "SMF": [{"expansion": "Session Management Function"}],
                             "AMF": [
-                                {"expansion": "Access and Mobility Management Function"},
-                                {"expansion": "Authentication Management Field"},
+                                {
+                                    "expansion": "Access and Mobility Management Function",
+                                    "sources": [{"series": "23", "source_document_key": "23_series/23003"}],
+                                },
+                                {
+                                    "expansion": "Authentication Management Field",
+                                    "sources": [{"series": "31", "source_document_key": "31_series/31102"}],
+                                },
                             ],
                         }
                     }
@@ -40,27 +65,10 @@ class VocabularyAssetsTests(unittest.TestCase):
         self.assertIn("PDU Session: A session definition", enriched)
         self.assertIn("SMF: Session Management Function", enriched)
         self.assertNotIn("AMF:", enriched)
-
-    def test_excluded_metadata_acronym_does_not_trigger_contextual_resolution(self) -> None:
-        vocabulary = Vocabulary(
-            {},
-            {},
-            {
-                "3GPP": [
-                    AmbiguousAbbreviationCandidate("Third Generation Partnership Project", ("33",), 1),
-                    AmbiguousAbbreviationCandidate("3rd Generation Partnership Project", ("33",), 1),
-                ],
-                "AMF": [
-                    AmbiguousAbbreviationCandidate("Access and Mobility Management Function", ("23",), 1),
-                    AmbiguousAbbreviationCandidate("Authentication Management Field", ("24",), 1),
-                ],
-            },
+        self.assertEqual(
+            vocabulary.ambiguous_abbreviations["AMF"][0].source_document_ids,
+            ("23003",),
         )
-
-        matches = vocabulary.ambiguous_matches("[3GPP Release 18] What is AMF?", 8, ["3gpp"])
-
-        self.assertEqual(list(matches), ["AMF"])
-
 
 if __name__ == "__main__":
     unittest.main()

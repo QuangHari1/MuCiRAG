@@ -17,8 +17,8 @@ experiment. **Do not download, chunk, or embed anything again** in that case.
 | Embeddings | `text-embedding-3-large`, 1,024 dimensions |
 | Rephrase and answer model | `gpt-4o-mini` |
 | Temperature | `0.0` |
-| Semantic seed chunks | 8 |
-| Citation expansion | Disabled (`citation_max_depth = 0`) |
+| Seed retrieval | Hybrid dense + BM25, fused with RRF; 8 chunks |
+| Citation expansion | One hop; at most 4 extra chunks (12 total) |
 | Tracking | MLflow local SQLite store and artifacts under `results/mlflow/` |
 
 The precomputed corpus contains 252,329 embedded chunks. The full chunk source
@@ -42,7 +42,7 @@ Telco-RAG/
     └── 3gpp/
         ├── Chunk/Rel-18/                  # ChunkSeries*.json
         ├── Embeddings/Rel-18/
-        │   └── paper-baseline-gsma-rel18/ # manifest, .npy, metadata JSONL
+        │   └── paper-baseline-gsma-rel18/ # manifest, vectors, metadata, lexical.sqlite3
         └── embedding_selections/
             └── paper-baseline-gsma-rel18.json
 ```
@@ -74,8 +74,12 @@ Install [uv](https://docs.astral.sh/uv/) and Python 3.11, then:
 ```bash
 cd newbaseline
 uv sync --all-groups
+uv run scripts/build_lexical_index.py
 uv run scripts/run_teleqna_benchmark.py --help
 ```
+
+The lexical index command is an offline, one-time step. It reads the existing
+chunks and writes `lexical.sqlite3`; it does not call an LLM or embedding API.
 
 `pyproject.toml` and `uv.lock` are the dependency source of truth. `uv sync`
 creates the ignored local `.venv` automatically; do not activate it manually.
@@ -87,7 +91,7 @@ Run one paid smoke-test question before a larger experiment:
 uv run \
   scripts/run_teleqna_benchmark.py \
   --limit 1 --workers 1 --progress-every 1 \
-  --output results/teleqna/smoke-test.jsonl --no-compare
+  --output results/teleqna/smoke-test.jsonl
 ```
 
 ## 3. Run a benchmark
@@ -101,7 +105,7 @@ question at a time, so rerunning the same command resumes safely.
 uv run \
   scripts/run_teleqna_benchmark.py \
   --workers 4 --progress-every 10 \
-  --output results/teleqna/repro-full.jsonl --no-compare
+  --output results/teleqna/repro-full.jsonl
 ```
 
 `--workers 4` processes four independent questions concurrently. Reduce it if
@@ -109,27 +113,30 @@ the provider rate-limits the account. The output's sibling
 `repro-full.manifest.json` records every non-secret run parameter and the
 TeleQnA SHA-256.
 
-### Harder tail-200 comparison
+### Last 200 questions
 
-This is the recommended quick experiment: reverse question order first, then
-take the last 200 numeric questions. It compares the candidate with the
-existing full baseline on exactly the shared scored questions.
+Reverse numeric question order first, then take 200 records. Comparison is off
+by default:
 
 ```bash
 uv run \
   scripts/run_teleqna_benchmark.py \
   --reverse --limit 200 --workers 4 --progress-every 10 \
-  --output results/teleqna/my-change-tail200.jsonl \
-  --compare-to results/teleqna/paper-baseline-gsma-rel18.jsonl
+  --output results/teleqna/hybrid-tail200.jsonl
 ```
 
-The terminal prints candidate accuracy, baseline accuracy, delta, improved and
-regressed counts. The same data is saved next to the run as
-`my-change-tail200.comparison.json`.
+To compare the same questions with an existing run, add:
 
-If the full baseline JSONL already exists and you omit `--output`, the runner
-automatically uses `results/teleqna/paper-baseline-gsma-rel18-tail200.jsonl`
-and compares it with `paper-baseline-gsma-rel18.jsonl`.
+```bash
+--compare-to results/teleqna/paper-baseline-gsma-rel18.jsonl
+```
+
+The terminal then prints candidate accuracy, baseline accuracy, delta,
+improved and regressed counts. The same data is saved next to the run as a
+`.comparison.json` file.
+
+Comparison is disabled by default. Add `--compare-to PATH` only when a paired
+comparison is wanted.
 
 ### Resume or restart
 
@@ -143,7 +150,7 @@ contribute to accuracy or comparisons.
 ## Results and error analysis
 
 Each benchmark JSONL row stores the answer, expected/predicted option,
-correctness, router decision, semantic retrieval traces, and citation paths.
+correctness, router decision, hybrid retrieval ranks, and citation paths.
 The full retrieved text is intentionally not repeated in every row.
 
 Generate error-analysis tables and a readable summary:
@@ -163,6 +170,21 @@ MLflow is local by default. Every benchmark records its config, progress/final
 metrics, result JSONL, manifest, comparison, and available analysis files under
 `results/mlflow/`; no account or cloud upload is needed. Set
 `[experiment_tracking].mode = "disabled"` in `config.toml` to turn this off.
+
+## Release-18 reference-link statistics
+
+To analyse the **full GSMA Release-18 corpus** (all local `raw.md` files, not
+the paper's 553-document selection), run:
+
+```bash
+uv run scripts/analyze_release18_references.py
+```
+
+This writes `results/release18-reference-stats/release18_reference_statistics.pdf`
+and a JSON audit file next to it.  The report counts distinct 3GPP/ETSI TS/TR
+targets found in each document's References section, excludes self-links, and
+separately reports targets that are present in the full local GSMA Rel-18
+corpus.  The JSON records every extracted source/target relation for audit.
 
 To browse runs locally, keep this command running in a second terminal from
 `newbaseline/`, then open <http://127.0.0.1:5000>:
@@ -185,51 +207,42 @@ and rerun tail-200. The benchmark manifest captures these settings.
 
 ```toml
 [rag]
-retrieval_top_k = 8          # number of semantic seed chunks
-citation_max_depth = 0       # 0 = no citation expansion
-citation_total_chunks = 8    # total context budget, including seeds
+retrieval_backend = "hybrid"
+retrieval_top_k = 8          # final dense + BM25 seed chunks
+citation_max_depth = 1       # follow citations one hop only
+citation_total_chunks = 12   # 8 seeds + at most 4 cited chunks
+citation_chunks_per_heading = 1
 ```
 
-To enable one-hop citation expansion while retaining eight seed chunks, use
-for example:
-
-```toml
-citation_max_depth = 1
-citation_total_chunks = 13
-citation_chunks_per_heading = 2
-```
+For each question, dense retrieval and BM25 each produce up to 32 candidates
+(`4 * retrieval_top_k`). Reciprocal Rank Fusion with `k = 60` combines their
+rankings and keeps the best 8, without comparing incompatible dense and BM25
+scores or introducing a learned weight. Citation expansion then follows exact
+resolved heading links from those seeds, globally ranks the targets against the
+query, and adds at most 4. One target chunk per heading avoids near-duplicate
+context; depth 1 avoids citation-chain drift.
 
 Changing `rephrase_model`, `answer_model`, temperature, retrieval limits, or
 citation settings does **not** require re-embedding. Changing `[embedding]`
 does require new vectors; also set `router_backend = "semantic"` if the
 embedding model is no longer the paper-compatible OpenAI model.
 
-### Vocabulary ablation
+### Vocabulary preprocessing
 
 `paper_legacy` reads the original paper DOCX and is the paper-equivalent
-baseline. `release18_unambiguous` keeps the 569 copied paper term definitions,
-but expands an acronym only when the provenance-rich Release-18 catalog has
-exactly one meaning.
+baseline. The default `release18_unambiguous` keeps the 569 copied paper term
+definitions and merges spelling-only expansion aliases, such as hyphen and case
+variants. It expands an acronym only when the cleaned Release-18 catalog has
+exactly one meaning. Genuinely ambiguous acronyms such as `AMF` remain unchanged
+and are handled by the embedding model and answer LLM from normal question and
+retrieval context.
 
-The default `release18_contextual` adds a semantic second pass only for a
-question containing an ambiguous acronym such as `AMF` or `ARP`:
-
-1. Retrieve seed chunks without expanding that acronym.
-2. Compare each candidate meaning against those seeds and its source-series provenance.
-3. Re-retrieve once with the winner only when its score and margin clear the
-   `[vocabulary]` thresholds; otherwise abstain and retain the acronym.
-
-This does not add an LLM call. The trace stores candidates, scores, confidence,
-margin, and the selected meaning for later error analysis. To reproduce the
-existing unambiguous ablation, change only:
+To reproduce the legacy vocabulary behavior, change only:
 
 ```toml
 [vocabulary]
-mode = "release18_unambiguous"
+mode = "paper_legacy"
 ```
-
-`contextual_excluded_acronyms = ["3GPP"]` is intentional: `[3GPP Release N]`
-is question metadata, not a term whose sense should affect retrieval.
 
 ## Run with Docker
 
@@ -259,7 +272,7 @@ docker run --rm -it \
   -v /absolute/path/to/dataset:/workspace/dataset:ro \
   -v telco-rag-results:/workspace/newbaseline/results \
   quanghari/telco-rag-newbaseline:latest \
-  newbaseline/scripts/run_teleqna_benchmark.py --limit 1 --no-compare
+  newbaseline/scripts/run_teleqna_benchmark.py --limit 1
 ```
 
 ## Rebuild the corpus (optional)

@@ -1,4 +1,4 @@
-"""FAISS retrieval over embeddings with metadata-to-source chunk traceability."""
+"""Dense/hybrid retrieval with metadata-to-source chunk traceability."""
 
 from __future__ import annotations
 
@@ -9,10 +9,13 @@ from typing import Any, Callable
 
 import numpy as np
 
+from .lexical import SqliteBm25Index, build_bm25_index
 from .types import CitationPath, RetrievalHit
 
 SUMMARY_SERIES = "release-summaries"
 RESOLVED_CITATION_STATUSES = {"resolved", "resolved_descendant"}
+HYBRID_CANDIDATE_MULTIPLIER = 4
+HYBRID_RRF_K = 60
 
 
 @dataclass(frozen=True)
@@ -28,7 +31,13 @@ class _CitationCandidate:
 class PaperEmbeddingCorpus:
     """Read a selected embedding collection and preserve every original chunk link."""
 
-    def __init__(self, embedding_root: Path, workspace_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        embedding_root: Path,
+        workspace_root: Path | None = None,
+        retrieval_backend: str = "semantic",
+        lexical_index_file: str = "lexical.sqlite3",
+    ) -> None:
         self.root = embedding_root
         self.manifest = json.loads((embedding_root / "manifest.json").read_text(encoding="utf-8"))
         self._series = self.manifest["series"]
@@ -41,6 +50,14 @@ class PaperEmbeddingCorpus:
         self._metadata_cache: dict[str, list[dict[str, Any]]] = {}
         self._chunk_cache: dict[str, list[dict[str, Any]]] = {}
         self._heading_index: dict[str, dict[tuple[str, str], list[dict[str, Any]]]] = {}
+        if retrieval_backend not in {"semantic", "hybrid"}:
+            raise ValueError(f"Unsupported retrieval backend: {retrieval_backend}")
+        self.retrieval_backend = retrieval_backend
+        self._lexical_index = (
+            SqliteBm25Index(embedding_root / lexical_index_file)
+            if retrieval_backend == "hybrid"
+            else None
+        )
 
     @property
     def available_numeric_series(self) -> set[str]:
@@ -57,12 +74,120 @@ class PaperEmbeddingCorpus:
             searched.append(SUMMARY_SERIES)
         return searched, empty
 
-    def search(self, selected_series: list[str], query_embedding: np.ndarray, top_k: int) -> tuple[list[RetrievalHit], list[str], list[str]]:
-        """Search selected populated groups plus summaries using inner product."""
+    def search(
+        self,
+        selected_series: list[str],
+        query_embedding: np.ndarray,
+        top_k: int,
+        query_text: str | None = None,
+    ) -> tuple[list[RetrievalHit], list[str], list[str]]:
+        """Search selected groups with semantic or rank-fused hybrid retrieval."""
+        if self.retrieval_backend == "hybrid":
+            if query_text is None:
+                raise ValueError("Hybrid retrieval requires query_text.")
+            candidate_k = max(top_k, top_k * HYBRID_CANDIDATE_MULTIPLIER)
+            dense_by_query, searched, empty = self.search_many(
+                selected_series,
+                np.asarray(query_embedding, dtype=np.float32).reshape(1, -1),
+                candidate_k,
+            )
+            lexical_hits = self._lexical_hits(query_text, searched, candidate_k)
+            return self._fuse_ranked_hits(dense_by_query[0], lexical_hits, top_k), searched, empty
         hits_by_query, searched, empty = self.search_many(
             selected_series, np.asarray(query_embedding, dtype=np.float32).reshape(1, -1), top_k
         )
         return hits_by_query[0], searched, empty
+
+    def _lexical_hits(
+        self,
+        query_text: str,
+        searched_series: list[str],
+        top_k: int,
+    ) -> list[RetrievalHit]:
+        if self._lexical_index is None:
+            return []
+        hits: list[RetrievalHit] = []
+        for series, metadata_index, bm25_score in self._lexical_index.search(
+            query_text, searched_series, top_k
+        ):
+            record = self._series[series]
+            metadata = self._load_metadata(record["metadata_file"])[metadata_index]
+            source_chunk_file = record["chunk_file"]
+            chunk = self._source_chunk(source_chunk_file, metadata)
+            hits.append(
+                RetrievalHit(
+                    score=bm25_score,
+                    series=series,
+                    text=chunk["text"],
+                    metadata=metadata,
+                    source_chunk_file=source_chunk_file,
+                    retrieval_method="lexical",
+                )
+            )
+        return hits
+
+    @staticmethod
+    def _fuse_ranked_hits(
+        dense_hits: list[RetrievalHit],
+        lexical_hits: list[RetrievalHit],
+        top_k: int,
+    ) -> list[RetrievalHit]:
+        """Fuse dense and BM25 rankings with reciprocal rank fusion."""
+        ranked: dict[tuple[str, str], dict[str, Any]] = {}
+        for method, hits in (("dense", dense_hits), ("lexical", lexical_hits)):
+            for rank, hit in enumerate(hits, start=1):
+                identity = hit.metadata.get("chunk_id", hit.metadata.get("source_chunk_index"))
+                key = (hit.series, str(identity))
+                row = ranked.setdefault(
+                    key,
+                    {"hit": hit, "score": 0.0, "dense_rank": None, "lexical_rank": None},
+                )
+                row["score"] += 1.0 / (HYBRID_RRF_K + rank)
+                row[f"{method}_rank"] = rank
+                if method == "dense":
+                    row["hit"] = hit
+        ordered = sorted(
+            ranked.values(),
+            key=lambda row: (
+                -float(row["score"]),
+                min(row["dense_rank"] or 10**9, row["lexical_rank"] or 10**9),
+                str(row["hit"].metadata.get("chunk_id", "")),
+            ),
+        )[:top_k]
+        return [
+            RetrievalHit(
+                score=float(row["score"]),
+                series=row["hit"].series,
+                text=row["hit"].text,
+                metadata=dict(row["hit"].metadata),
+                source_chunk_file=row["hit"].source_chunk_file,
+                retrieval_method="hybrid",
+                dense_rank=row["dense_rank"],
+                lexical_rank=row["lexical_rank"],
+            )
+            for row in ordered
+        ]
+
+    def build_lexical_index(self, output_path: Path) -> int:
+        """Build the persistent BM25 index aligned to embedding metadata rows."""
+        def rows():
+            for series, record in self._series.items():
+                metadata_rows = self._load_metadata(record["metadata_file"])
+                for metadata_index, metadata in enumerate(metadata_rows):
+                    chunk = self._source_chunk(record["chunk_file"], metadata)
+                    chunk_id = metadata.get("chunk_id")
+                    if not isinstance(chunk_id, str) or not isinstance(chunk.get("text"), str):
+                        continue
+                    heading = chunk.get("heading")
+                    yield (
+                        chunk_id,
+                        series,
+                        metadata_index,
+                        heading if isinstance(heading, str) else "",
+                        chunk["text"],
+                    )
+
+        return build_bm25_index(output_path, rows())
 
     def search_many(
         self, selected_series: list[str], query_embeddings: np.ndarray, top_k: int
@@ -214,6 +339,7 @@ class PaperEmbeddingCorpus:
                             citation_depth=depth,
                             parent_chunk_id=parent_chunk_id,
                             citation=dict(reference),
+                            retrieval_method="citation",
                         )
                         selected.append(hit)
                         next_frontier.append(hit)
@@ -336,6 +462,7 @@ class PaperEmbeddingCorpus:
                 citation_depth=1,
                 parent_chunk_id=candidate.parent.metadata["chunk_id"],
                 citation=candidate.reference,
+                retrieval_method="citation",
             )
             for candidate in ranked_candidates
         ]

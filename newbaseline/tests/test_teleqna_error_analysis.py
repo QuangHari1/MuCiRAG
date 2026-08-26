@@ -100,7 +100,7 @@ class TeleQnAErrorAnalysisTests(unittest.TestCase):
             self.assertEqual(summary["accuracy"], 0.5)
             for name in (
                 "summary.md", "summary.json", "questions.csv", "errors.csv", "retrievals.csv",
-                "citation_paths.csv", "abbreviation_resolutions.csv",
+                "citation_paths.csv",
             ):
                 self.assertTrue((output_dir / name).is_file())
             errors = (output_dir / "errors.csv").read_text(encoding="utf-8")

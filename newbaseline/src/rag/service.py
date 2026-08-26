@@ -6,7 +6,6 @@ import numpy as np
 
 from ..settings import Settings, load_settings
 from ..embeddings import create_embedding_provider
-from .abbreviation_resolver import ContextualAbbreviationResolver
 from .clients import OpenAICompatibleRagClient, RagClient
 from .corpus import PaperEmbeddingCorpus
 from .router import PaperNNRouter, SemanticSeriesRouter
@@ -70,15 +69,18 @@ class PaperRagService:
             )
         else:
             raise ValueError(f"Unsupported [rag].router_backend: {self.settings.get('rag', 'router_backend')}")
-        self.corpus = corpus or PaperEmbeddingCorpus(embedding_root, self.settings.workspace_root)
+        self.corpus = corpus or PaperEmbeddingCorpus(
+            embedding_root,
+            self.settings.workspace_root,
+            retrieval_backend=self.settings.get("rag", "retrieval_backend"),
+            lexical_index_file=self.settings.get("rag", "lexical_index_file"),
+        )
         vocabulary_mode = self.settings.get("vocabulary", "mode")
-        self._contextual_abbreviation_resolution = vocabulary_mode == "release18_contextual"
-        self.abbreviation_resolver = ContextualAbbreviationResolver()
         if vocabulary is not None:
             self.vocabulary = vocabulary
         elif vocabulary_mode == "paper_legacy":
             self.vocabulary = Vocabulary.from_docx(resources / self.settings.get("rag", "vocabulary"))
-        elif vocabulary_mode in {"release18_unambiguous", "release18_contextual"}:
+        elif vocabulary_mode == "release18_unambiguous":
             self.vocabulary = Vocabulary.from_release18_assets(
                 resources / self.settings.get("vocabulary", "definitions_file"),
                 resources / self.settings.get("vocabulary", "abbreviations_file"),
@@ -105,50 +107,11 @@ class PaperRagService:
         query_embedding = np.asarray(self.client.embed(enriched), dtype=np.float32)
         selected = self.router.route(query_embedding, self.settings.get("rag", "router_top_k"))
         seed_retrievals, searched, empty = self.corpus.search(
-            selected, query_embedding, self.settings.get("rag", "retrieval_top_k")
+            selected,
+            query_embedding,
+            self.settings.get("rag", "retrieval_top_k"),
+            query_text=question,
         )
-        abbreviation_resolutions = []
-        if getattr(self, "_contextual_abbreviation_resolution", False):
-            matches = self.vocabulary.ambiguous_matches(
-                rephrased,
-                self.settings.get("vocabulary", "contextual_candidate_limit"),
-                self.settings.get("vocabulary", "contextual_excluded_acronyms"),
-            )
-            if matches:
-                candidate_queries = self.abbreviation_resolver.candidate_queries(rephrased, matches)
-                candidate_embeddings = np.asarray(
-                    self.client.embed_many([candidate.render(rephrased) for candidate in candidate_queries]),
-                    dtype=np.float32,
-                )
-                candidate_hits_by_query, _, _ = self.corpus.search_many(
-                    selected,
-                    candidate_embeddings,
-                    self.settings.get("vocabulary", "contextual_support_top_k"),
-                )
-                candidate_hits = {
-                    (candidate.acronym, candidate.candidate.expansion): hits
-                    for candidate, hits in zip(candidate_queries, candidate_hits_by_query, strict=True)
-                }
-                abbreviation_resolutions = self.abbreviation_resolver.resolve(
-                    matches,
-                    candidate_hits,
-                    seed_retrievals,
-                    selected,
-                    self.settings.get("vocabulary", "contextual_min_score"),
-                    self.settings.get("vocabulary", "contextual_min_margin"),
-                )
-                resolved_abbreviations = {
-                    resolution.acronym: resolution.selected_expansion
-                    for resolution in abbreviation_resolutions
-                    if resolution.selected_expansion is not None
-                }
-                if resolved_abbreviations:
-                    enriched = self.vocabulary.enrich(rephrased, resolved_abbreviations)
-                    query_embedding = np.asarray(self.client.embed(enriched), dtype=np.float32)
-                    selected = self.router.route(query_embedding, self.settings.get("rag", "router_top_k"))
-                    seed_retrievals, searched, empty = self.corpus.search(
-                        selected, query_embedding, self.settings.get("rag", "retrieval_top_k")
-                    )
         retrievals, citation_paths = self.corpus.expand_citations(
             seed_retrievals,
             max_depth=self.settings.get("rag", "citation_max_depth"),
@@ -175,7 +138,6 @@ class PaperRagService:
             retrievals=retrievals,
             answer=answer,
             citation_paths=citation_paths,
-            abbreviation_resolutions=abbreviation_resolutions,
         )
 
     @staticmethod
