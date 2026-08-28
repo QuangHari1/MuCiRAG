@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from ..settings import Settings, load_settings
 from ..embeddings import create_embedding_provider
+from .anchor_hierarchy import AnchorHierarchy, sha256_file
 from .clients import OpenAICompatibleRagClient, RagClient
 from .corpus import PaperEmbeddingCorpus
 from .router import PaperNNRouter, SemanticSeriesRouter
@@ -26,13 +29,7 @@ class PaperRagService:
     ) -> None:
         self.settings = settings or load_settings()
         resources = self.settings.workspace_root / self.settings.get("rag", "resources_dir")
-        embedding_root = (
-            self.settings.dataset_dir
-            / "3gpp"
-            / "Embeddings"
-            / f"Rel-{self.settings.release}"
-            / self.settings.get("rag", "selection_id")
-        )
+        embedding_root = self.settings.embedding_root(self.settings.get("rag", "selection_id"))
         embedding_provider = create_embedding_provider(self.settings) if client is None else None
         self.client = client or OpenAICompatibleRagClient(
             embedding_provider=embedding_provider,
@@ -44,7 +41,12 @@ class PaperRagService:
             thinking_mode=self.settings.get("llm", "thinking_mode"),
             temperature=self.settings.get("llm", "temperature"),
         )
-        if router is not None:
+        self.anchor_strategy = self.settings.get("rag", "anchor_strategy")
+        if self.anchor_strategy not in {"router", "hierarchical"}:
+            raise ValueError(f"Unsupported [rag].anchor_strategy: {self.anchor_strategy}")
+        if self.anchor_strategy == "hierarchical":
+            self.router = None
+        elif router is not None:
             self.router = router
         elif self.settings.get("rag", "router_backend") == "paper_nn":
             if (
@@ -74,7 +76,26 @@ class PaperRagService:
             self.settings.workspace_root,
             retrieval_backend=self.settings.get("rag", "retrieval_backend"),
             lexical_index_file=self.settings.get("rag", "lexical_index_file"),
+            rrf_dense_weight=self.settings.get("rag", "rrf_dense_weight"),
+            rrf_bm25_weight=self.settings.get("rag", "rrf_bm25_weight"),
         )
+        self.anchor_hierarchy: AnchorHierarchy | None = None
+        if self.anchor_strategy == "hierarchical":
+            anchor_root_value = Path(self.settings.get("rag", "anchor_hierarchy_embedding_root"))
+            anchor_root = (
+                anchor_root_value
+                if anchor_root_value.is_absolute()
+                else self.settings.workspace_root / anchor_root_value
+            )
+            self.anchor_hierarchy = AnchorHierarchy.load(
+                anchor_root,
+                manifest_file=self.settings.get("rag", "anchor_hierarchy_manifest_file"),
+                vectors_file=self.settings.get("rag", "anchor_hierarchy_vectors_file"),
+                corpus_manifest_sha256=sha256_file(anchor_root / "manifest.json"),
+                embedding_backend=self.settings.get("embedding", "backend"),
+                embedding_model=self.settings.get("embedding", "model"),
+                dimensions=self.settings.get("embedding", "dimensions"),
+            )
         vocabulary_mode = self.settings.get("vocabulary", "mode")
         if vocabulary is not None:
             self.vocabulary = vocabulary
@@ -102,27 +123,65 @@ class PaperRagService:
         """
         if not question.strip():
             raise ValueError("Question must not be empty.")
+        citation_strategy = self.settings.get("rag", "citation_strategy")
+        if citation_strategy not in {"gain", "semantic_bfs", "rrf_bfs"}:
+            raise ValueError(f"Unsupported citation strategy: {citation_strategy}")
         rephrased = self.client.rephrase(question)
         enriched = self.vocabulary.enrich(rephrased)
         query_embedding = np.asarray(self.client.embed(enriched), dtype=np.float32)
-        selected = self.router.route(query_embedding, self.settings.get("rag", "router_top_k"))
-        seed_retrievals, searched, empty = self.corpus.search(
-            selected,
-            query_embedding,
-            self.settings.get("rag", "retrieval_top_k"),
-            query_text=question,
-        )
+        if query_embedding.ndim != 1:
+            raise ValueError("Query embedding has an invalid shape.")
+        if self.anchor_strategy == "hierarchical":
+            selected: list[str] = []
+            empty: list[str] = []
+            if self.anchor_hierarchy is None:  # pragma: no cover - constructor invariant
+                raise RuntimeError("Hierarchical anchor artifact was not loaded.")
+            seed_retrievals, searched = self.corpus.search_hierarchical(
+                query_embedding,
+                self.settings.get("rag", "retrieval_top_k"),
+                query_text=question,
+                hierarchy=self.anchor_hierarchy,
+                series_weight=self.settings.get("rag", "anchor_series_weight"),
+                document_weight=self.settings.get("rag", "anchor_document_weight"),
+                chunk_weight=self.settings.get("rag", "anchor_chunk_weight"),
+            )
+        else:
+            if self.router is None:  # pragma: no cover - constructor invariant
+                raise RuntimeError("Router was not initialized.")
+            selected = self.router.route(query_embedding, self.settings.get("rag", "router_top_k"))
+            seed_retrievals, searched, empty = self.corpus.search(
+                selected,
+                query_embedding,
+                self.settings.get("rag", "retrieval_top_k"),
+                query_text=question,
+            )
+        # Facets belong only to gain verification. Semantic BFS intentionally
+        # reproduces the older query-similarity citation selection.
+        facets: list[str] = []
+        facet_embeddings = np.empty((0, query_embedding.shape[0]), dtype=np.float32)
+        if citation_strategy == "gain":
+            facets = self.client.extract_facets(question)
+            facet_embeddings = np.asarray(self.client.embed_many(facets), dtype=np.float32)
+            if facet_embeddings.ndim != 2 or len(facet_embeddings) != len(facets):
+                raise ValueError("Facet embeddings have an invalid shape.")
+        citation_min_gain = self.settings.get("rag", "citation_min_gain")
+        citation_max_chunks = self.settings.get("rag", "citation_max_chunks")
         retrievals, citation_paths = self.corpus.expand_citations(
             seed_retrievals,
             max_depth=self.settings.get("rag", "citation_max_depth"),
-            total_limit=self.settings.get("rag", "citation_total_chunks"),
+            max_citation_chunks=citation_max_chunks,
             chunks_per_heading=self.settings.get("rag", "citation_chunks_per_heading"),
-            query_embedding=query_embedding,
+            facets=facets,
+            facet_embeddings=facet_embeddings,
+            min_gain=citation_min_gain,
             embed_many=self.client.embed_many,
+            selection_strategy=citation_strategy,
+            query_embedding=query_embedding,
+            query_text=enriched,
         )
         answer = None
         if include_answer:
-            contexts = [self._format_context(hit) for hit in retrievals]
+            contexts = self._format_contexts(retrievals)
             answer = self.client.answer(
                 answer_prompt or question,
                 contexts,
@@ -131,23 +190,49 @@ class PaperRagService:
         return RagResult(
             question=question,
             rephrased_query=rephrased,
+            query_facets=facets,
             enriched_query=enriched,
             router_selected_series=selected,
             empty_selected_series=empty,
             searched_series=searched,
+            citation_min_gain=citation_min_gain,
+            citation_max_chunks=citation_max_chunks,
             retrievals=retrievals,
             answer=answer,
             citation_paths=citation_paths,
+            citation_strategy=citation_strategy,
+            anchor_strategy=self.anchor_strategy,
+            anchor_provenance=(self.anchor_hierarchy.provenance if self.anchor_hierarchy else None),
         )
 
     @staticmethod
+    def _format_contexts(retrievals) -> list[str]:
+        """Preserve baseline seed blocks and append neutral citation candidates."""
+        seeds = [hit for hit in retrievals if hit.origin != "citation"]
+        citations = [hit for hit in retrievals if hit.origin == "citation"]
+        return [
+            PaperRagService._format_context(hit)
+            for hit in [*seeds, *citations]
+        ]
+
+    @staticmethod
     def _format_context(hit) -> str:
-        """Keep LLM provenance compact; full citation metadata remains in the trace."""
+        """Keep seed formatting baseline-compatible and cite labels neutral."""
         metadata = hit.metadata
-        source = (
-            f"series={hit.series}; document={metadata.get('document_id')}; "
-            f"heading={metadata.get('heading')}; chunk_id={metadata.get('chunk_id')}"
-        )
+        chunk_id = metadata.get("chunk_id")
         if hit.origin == "citation":
-            source += f"; citation_depth={hit.citation_depth}; parent={hit.parent_chunk_id}"
-        return f"[{source}]\n{hit.text}"
+            source = (
+                "Referenced candidate; "
+                f"series={hit.series}; document={metadata.get('document_id')}; "
+                f"heading={metadata.get('heading')}; chunk_id={chunk_id}; "
+                f"citation_depth={hit.citation_depth}; cited_by={hit.parent_chunk_id}; "
+                f"path={hit.parent_chunk_id} -> {chunk_id}"
+            )
+            context = f"[{source}]\n{hit.text}"
+        else:
+            source = (
+            f"series={hit.series}; document={metadata.get('document_id')}; "
+            f"heading={metadata.get('heading')}; chunk_id={chunk_id}"
+            )
+            context = f"[{source}]\n{hit.text}"
+        return context

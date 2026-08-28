@@ -149,6 +149,9 @@ def build_paper_selection(
         )
 
     if include_release_summaries:
+        # Paper-mode is intentionally 549 mapped specifications plus these
+        # four DOCX summaries; the summaries have their own document keys and
+        # are never substituted for a numbered GSMA specification.
         summary_dir = WORKSPACE_ROOT / SETTINGS.get("paper_release_summaries", "source_dir")
         for release in SETTINGS.get("paper_release_summaries", "source_releases"):
             filename = f"rel_{release}.docx"

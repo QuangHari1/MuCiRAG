@@ -27,6 +27,15 @@ from newbaseline.src.rag.service import PaperRagService
 from newbaseline.src.settings import load_settings
 
 
+def resolve_newbaseline_path(path: Path) -> Path:
+    """Resolve CLI paths from newbaseline/, accepting an accidental leading prefix."""
+    if path.is_absolute():
+        return path
+    if path.parts and path.parts[0] == "newbaseline":
+        path = Path(*path.parts[1:])
+    return (NEWBASELINE_ROOT / path).resolve()
+
+
 def load_records(path: Path) -> dict[str, dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -87,13 +96,9 @@ def vocabulary_manifest_config(settings: Any) -> dict[str, Any]:
 
 def benchmark_config(settings: Any, args: argparse.Namespace, dataset_path: Path) -> dict[str, Any]:
     """Persist every non-secret setting that can affect a benchmark result."""
-    lexical_index_path = (
-        settings.dataset_dir
-        / "3gpp"
-        / "Embeddings"
-        / f"Rel-{settings.release}"
-        / settings.get("rag", "selection_id")
-        / settings.get("rag", "lexical_index_file")
+    citation_strategy = settings.get("rag", "citation_strategy")
+    lexical_index_path = settings.embedding_root(settings.get("rag", "selection_id")) / settings.get(
+        "rag", "lexical_index_file"
     )
     config = {
         "dataset_path": str(dataset_path),
@@ -109,19 +114,49 @@ def benchmark_config(settings: Any, args: argparse.Namespace, dataset_path: Path
         "answer_model": settings.get("rag", "answer_model"),
         "router_backend": settings.get("rag", "router_backend"),
         "router_top_k": settings.get("rag", "router_top_k"),
+        "anchor_strategy": settings.get("rag", "anchor_strategy"),
+        "anchor_series_weight": settings.get("rag", "anchor_series_weight"),
+        "anchor_document_weight": settings.get("rag", "anchor_document_weight"),
+        "anchor_chunk_weight": settings.get("rag", "anchor_chunk_weight"),
+        "anchor_hierarchy_manifest_file": settings.get("rag", "anchor_hierarchy_manifest_file"),
         "retrieval_backend": settings.get("rag", "retrieval_backend"),
         "retrieval_top_k": settings.get("rag", "retrieval_top_k"),
         "lexical_index_file": settings.get("rag", "lexical_index_file"),
         "hybrid_candidate_multiplier": HYBRID_CANDIDATE_MULTIPLIER,
         "hybrid_rrf_k": HYBRID_RRF_K,
+        "rrf_dense_weight": settings.get("rag", "rrf_dense_weight"),
+        "rrf_bm25_weight": settings.get("rag", "rrf_bm25_weight"),
+        "citation_strategy": citation_strategy,
         "citation_max_depth": settings.get("rag", "citation_max_depth"),
-        "citation_total_chunks": settings.get("rag", "citation_total_chunks"),
+        "citation_min_gain": settings.get("rag", "citation_min_gain"),
+        "citation_max_chunks": settings.get("rag", "citation_max_chunks"),
         "citation_chunks_per_heading": settings.get("rag", "citation_chunks_per_heading"),
+        "citation_gain_baseline": "parent_chunk" if citation_strategy == "gain" else None,
+        "citation_semantic_query": (
+            "enriched_rephrased_query"
+            if citation_strategy in {"semantic_bfs", "rrf_bfs"}
+            else None
+        ),
+        "citation_rrf_k": HYBRID_RRF_K if citation_strategy == "rrf_bfs" else None,
+        "facets_used_for_seed_retrieval": False,
+        "answer_context_policy": "baseline_seeds_append_neutral_citations",
         "workers": args.workers,
         "limit": args.limit,
     }
     if config["retrieval_backend"] == "hybrid":
         config["lexical_index_sha256"] = file_sha256(lexical_index_path)
+    if config["anchor_strategy"] == "hierarchical":
+        anchor_root = Path(settings.get("rag", "anchor_hierarchy_embedding_root"))
+        if not anchor_root.is_absolute():
+            anchor_root = settings.workspace_root / anchor_root
+        artifact_path = anchor_root / settings.get("rag", "anchor_hierarchy_manifest_file")
+        if not artifact_path.is_file():
+            raise FileNotFoundError(
+                "Hierarchical anchors require prepared artifacts. Run "
+                "`cd newbaseline && uv run python scripts/embed_anchor_hierarchy.py` first."
+            )
+        config["anchor_hierarchy_manifest_sha256"] = file_sha256(artifact_path)
+        config["anchor_hierarchy_provenance"] = json.loads(artifact_path.read_text(encoding="utf-8"))
     config.update(vocabulary_manifest_config(settings))
     return config
 
@@ -208,7 +243,10 @@ def parse_args(settings: Any) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        help="Checkpoint JSONL. Defaults to a name derived from --reverse and --limit.",
+        help=(
+            "Checkpoint JSONL, resolved from newbaseline/. "
+            "Defaults to a name derived from --reverse and --limit."
+        ),
     )
     parser.add_argument("--limit", type=int, help="Run only the first N records, for a paid smoke test.")
     parser.add_argument(
@@ -219,7 +257,10 @@ def parse_args(settings: Any) -> argparse.Namespace:
     parser.add_argument(
         "--compare-to",
         type=Path,
-        help="Existing benchmark JSONL to compare against. Comparison is disabled unless this is supplied.",
+        help=(
+            "Existing benchmark JSONL, resolved from newbaseline/. "
+            "Comparison is disabled unless this is supplied."
+        ),
     )
     parser.add_argument("--overwrite", action="store_true", help="Discard an existing output checkpoint.")
     parser.add_argument(
@@ -241,6 +282,11 @@ def parse_args(settings: Any) -> argparse.Namespace:
         parser.error("--progress-every must be positive")
     if args.workers < 1:
         parser.error("--workers must be positive")
+    args.dataset = resolve_newbaseline_path(args.dataset)
+    if args.output is not None:
+        args.output = resolve_newbaseline_path(args.output)
+    if args.compare_to is not None:
+        args.compare_to = resolve_newbaseline_path(args.compare_to)
     result_directory = Path(settings.get("evaluation", "teleqna_output_dir"))
     if not result_directory.is_absolute():
         result_directory = NEWBASELINE_ROOT / result_directory

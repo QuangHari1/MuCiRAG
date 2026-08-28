@@ -47,18 +47,29 @@ def discover_source_documents(
 
 
 def load_selected_document_keys(selection_path: Path | None) -> set[str] | None:
-    """Read the shared selection format used by chunking and embedding."""
+    """Read and validate the shared selection format used by offline stages."""
     if selection_path is None:
         return None
     payload = json.loads(selection_path.read_text(encoding="utf-8"))
     documents = payload.get("documents")
     if not isinstance(documents, list):
         raise ValueError(f"Selection has no documents list: {selection_path}")
-    keys = {
-        document["document_key"]
-        for document in documents
-        if isinstance(document, dict) and isinstance(document.get("document_key"), str)
-    }
+    keys: set[str] = set()
+    for index, document in enumerate(documents):
+        if not isinstance(document, dict) or not isinstance(document.get("document_key"), str):
+            raise ValueError(f"Selection has invalid document at index {index}: {selection_path}")
+        document_key = document["document_key"]
+        if document_key in keys:
+            raise ValueError(f"Selection has duplicate document_key {document_key!r}: {selection_path}")
+        keys.add(document_key)
     if not keys:
         raise ValueError(f"Selection has no document keys: {selection_path}")
+    declared_count = payload.get("document_count")
+    if declared_count is not None and (
+        isinstance(declared_count, bool) or not isinstance(declared_count, int) or declared_count != len(keys)
+    ):
+        raise ValueError(
+            f"Selection document_count={declared_count!r} does not match {len(keys)} unique document keys: "
+            f"{selection_path}"
+        )
     return keys

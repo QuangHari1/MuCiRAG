@@ -32,3 +32,4 @@
 # Misc
 .DS_Store
 *.pem
+/newbaseline/results/

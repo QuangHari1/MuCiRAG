@@ -3,29 +3,20 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 
+from .anchor_hierarchy import AnchorHierarchy, normalize_vector
+from .citation_expansion import CitationExpander
 from .lexical import SqliteBm25Index, build_bm25_index
 from .types import CitationPath, RetrievalHit
 
 SUMMARY_SERIES = "release-summaries"
-RESOLVED_CITATION_STATUSES = {"resolved", "resolved_descendant"}
 HYBRID_CANDIDATE_MULTIPLIER = 4
 HYBRID_RRF_K = 60
-
-
-@dataclass(frozen=True)
-class _CitationCandidate:
-    parent: RetrievalHit
-    reference: dict[str, Any]
-    target: dict[str, Any]
-    target_file: str
-    score: float | None
-    order: int
 
 
 class PaperEmbeddingCorpus:
@@ -37,6 +28,8 @@ class PaperEmbeddingCorpus:
         workspace_root: Path | None = None,
         retrieval_backend: str = "semantic",
         lexical_index_file: str = "lexical.sqlite3",
+        rrf_dense_weight: float = 0.5,
+        rrf_bm25_weight: float = 0.5,
     ) -> None:
         self.root = embedding_root
         self.manifest = json.loads((embedding_root / "manifest.json").read_text(encoding="utf-8"))
@@ -52,11 +45,21 @@ class PaperEmbeddingCorpus:
         self._heading_index: dict[str, dict[tuple[str, str], list[dict[str, Any]]]] = {}
         if retrieval_backend not in {"semantic", "hybrid"}:
             raise ValueError(f"Unsupported retrieval backend: {retrieval_backend}")
+        self._validate_rrf_weights(rrf_dense_weight, rrf_bm25_weight)
         self.retrieval_backend = retrieval_backend
+        self.rrf_dense_weight = rrf_dense_weight
+        self.rrf_bm25_weight = rrf_bm25_weight
         self._lexical_index = (
             SqliteBm25Index(embedding_root / lexical_index_file)
             if retrieval_backend == "hybrid"
             else None
+        )
+        self._citation_expander = CitationExpander(
+            self._resolve_target,
+            self._chunk_for_hit,
+            self._lexical_index,
+            rrf_dense_weight,
+            rrf_bm25_weight,
         )
 
     @property
@@ -66,6 +69,11 @@ class PaperEmbeddingCorpus:
     @property
     def has_summaries(self) -> bool:
         return SUMMARY_SERIES in self._series
+
+    @property
+    def all_series(self) -> list[str]:
+        """Every group in manifest order, including release summaries."""
+        return list(self._series)
 
     def searched_series_for(self, selected_series: list[str]) -> tuple[list[str], list[str]]:
         searched = [series for series in selected_series if series in self.available_numeric_series]
@@ -92,11 +100,189 @@ class PaperEmbeddingCorpus:
                 candidate_k,
             )
             lexical_hits = self._lexical_hits(query_text, searched, candidate_k)
-            return self._fuse_ranked_hits(dense_by_query[0], lexical_hits, top_k), searched, empty
+            return self._fuse_ranked_hits(
+                dense_by_query[0],
+                lexical_hits,
+                top_k,
+                dense_weight=self.rrf_dense_weight,
+                bm25_weight=self.rrf_bm25_weight,
+            ), searched, empty
         hits_by_query, searched, empty = self.search_many(
             selected_series, np.asarray(query_embedding, dtype=np.float32).reshape(1, -1), top_k
         )
         return hits_by_query[0], searched, empty
+
+    def search_hierarchical(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int,
+        *,
+        query_text: str | None,
+        hierarchy: AnchorHierarchy,
+        series_weight: float,
+        document_weight: float,
+        chunk_weight: float,
+    ) -> tuple[list[RetrievalHit], list[str]]:
+        """Rank all manifest chunks before applying the normal optional RRF step."""
+        if top_k < 1:
+            raise ValueError("top_k must be positive.")
+        weights = (series_weight, document_weight, chunk_weight)
+        if any(weight < 0 for weight in weights) or not np.isclose(sum(weights), 1.0):
+            raise ValueError("Hierarchical anchor weights must be non-negative and sum to 1.")
+        candidate_k = max(top_k, top_k * HYBRID_CANDIDATE_MULTIPLIER) if self.retrieval_backend == "hybrid" else top_k
+        dense_hits = self._hierarchical_dense_hits(
+            query_embedding,
+            candidate_k,
+            hierarchy,
+            series_weight,
+            document_weight,
+            chunk_weight,
+        )
+        searched = self.all_series
+        if self.retrieval_backend != "hybrid":
+            return dense_hits[:top_k], searched
+        if query_text is None:
+            raise ValueError("Hybrid retrieval requires query_text.")
+        lexical_hits = [
+            self._with_hierarchical_scores(
+                hit,
+                query_embedding,
+                hierarchy,
+                series_weight,
+                document_weight,
+                chunk_weight,
+            )
+            for hit in self._lexical_hits(query_text, searched, candidate_k)
+        ]
+        return self._fuse_ranked_hits(
+            dense_hits,
+            lexical_hits,
+            top_k,
+            dense_weight=self.rrf_dense_weight,
+            bm25_weight=self.rrf_bm25_weight,
+        ), searched
+
+    def _with_hierarchical_scores(
+        self,
+        hit: RetrievalHit,
+        query_embedding: np.ndarray,
+        hierarchy: AnchorHierarchy,
+        series_weight: float,
+        document_weight: float,
+        chunk_weight: float,
+    ) -> RetrievalHit:
+        """Attach hierarchy diagnostics to a lexical-only candidate before RRF."""
+        record = self._series[hit.series]
+        metadata_rows = self._load_metadata(record["metadata_file"])
+        chunk_id = hit.metadata.get("chunk_id")
+        row_index = next(
+            (
+                index
+                for index, metadata in enumerate(metadata_rows)
+                if metadata.get("chunk_id") == chunk_id
+            ),
+            None,
+        )
+        if row_index is None:
+            raise ValueError(f"Cannot locate lexical hierarchy candidate {chunk_id!r}.")
+        query = normalize_vector(np.asarray(query_embedding, dtype=np.float32))
+        vector = np.asarray(np.load(self.root / record["vector_file"], mmap_mode="r")[row_index], dtype=np.float32)
+        chunk_score = float(query @ vector / max(float(np.linalg.norm(vector)), 1e-12))
+        document_key = hit.metadata.get("document_key")
+        document_vector = hierarchy.document_vectors.get(document_key) if isinstance(document_key, str) else None
+        series_vector = hierarchy.series_vectors.get(hit.series)
+        if document_vector is None or series_vector is None:
+            raise ValueError(f"Hierarchy artifact is incomplete for lexical candidate {chunk_id!r}.")
+        document_score = float(query @ document_vector)
+        series_score = float(query @ series_vector)
+        combined = series_weight * series_score + document_weight * document_score + chunk_weight * chunk_score
+        return replace(
+            hit,
+            anchor_series_score=series_score,
+            anchor_document_score=document_score,
+            anchor_chunk_score=chunk_score,
+            anchor_hierarchical_score=combined,
+        )
+
+    def _hierarchical_dense_hits(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int,
+        hierarchy: AnchorHierarchy,
+        series_weight: float,
+        document_weight: float,
+        chunk_weight: float,
+    ) -> list[RetrievalHit]:
+        query = normalize_vector(np.asarray(query_embedding, dtype=np.float32))
+        score_parts: list[np.ndarray] = []
+        chunk_parts: list[np.ndarray] = []
+        document_parts: list[np.ndarray] = []
+        series_parts: list[np.ndarray] = []
+        ranges: list[tuple[int, int, str]] = []
+        offset = 0
+        for series, record in self._series.items():
+            series_vector = hierarchy.series_vectors.get(series)
+            if series_vector is None:
+                raise ValueError(f"Hierarchy artifact has no series vector for {series!r}.")
+            vectors = np.asarray(np.load(self.root / record["vector_file"], mmap_mode="r"), dtype=np.float32)
+            metadata = self._load_metadata(record["metadata_file"])
+            if len(vectors) != len(metadata):
+                raise ValueError(f"Embedding and metadata rows differ for {series}.")
+            chunk_scores = (vectors @ query) / np.maximum(np.linalg.norm(vectors, axis=1), 1e-12)
+            document_scores = np.empty(len(metadata), dtype=np.float32)
+            for index, item in enumerate(metadata):
+                document_key = item.get("document_key")
+                document_vector = hierarchy.document_vectors.get(document_key) if isinstance(document_key, str) else None
+                if document_vector is None:
+                    raise ValueError(
+                        f"Hierarchy artifact has no document vector for {document_key!r} in series {series}."
+                    )
+                document_scores[index] = float(query @ document_vector)
+            series_score = float(query @ series_vector)
+            combined = (
+                series_weight * series_score
+                + document_weight * document_scores
+                + chunk_weight * chunk_scores
+            )
+            score_parts.append(combined)
+            chunk_parts.append(chunk_scores)
+            document_parts.append(document_scores)
+            series_parts.append(np.full(len(metadata), series_score, dtype=np.float32))
+            ranges.append((offset, offset + len(metadata), series))
+            offset += len(metadata)
+        if not score_parts:
+            return []
+        scores = np.concatenate(score_parts)
+        chunk_scores = np.concatenate(chunk_parts)
+        document_scores = np.concatenate(document_parts)
+        series_scores = np.concatenate(series_parts)
+        limit = min(top_k, len(scores))
+        positions = np.argpartition(-scores, limit - 1)[:limit]
+        positions = sorted(positions.tolist(), key=lambda position: (-float(scores[position]), position))
+        ends = np.asarray([end for _, end, _ in ranges])
+        hits: list[RetrievalHit] = []
+        for position in positions:
+            series_index = int(np.searchsorted(ends, position, side="right"))
+            start, _, series = ranges[series_index]
+            local_index = position - start
+            record = self._series[series]
+            metadata = self._load_metadata(record["metadata_file"])[local_index]
+            chunk = self._source_chunk(record["chunk_file"], metadata)
+            hits.append(
+                RetrievalHit(
+                    score=float(scores[position]),
+                    series=series,
+                    text=chunk["text"],
+                    metadata=metadata,
+                    source_chunk_file=record["chunk_file"],
+                    retrieval_method="hierarchical_semantic",
+                    anchor_series_score=float(series_scores[position]),
+                    anchor_document_score=float(document_scores[position]),
+                    anchor_chunk_score=float(chunk_scores[position]),
+                    anchor_hierarchical_score=float(scores[position]),
+                )
+            )
+        return hits
 
     def _lexical_hits(
         self,
@@ -131,10 +317,17 @@ class PaperEmbeddingCorpus:
         dense_hits: list[RetrievalHit],
         lexical_hits: list[RetrievalHit],
         top_k: int,
+        *,
+        dense_weight: float = 0.5,
+        bm25_weight: float = 0.5,
     ) -> list[RetrievalHit]:
-        """Fuse dense and BM25 rankings with reciprocal rank fusion."""
+        """Fuse dense and BM25 rankings with weighted reciprocal rank fusion."""
+        PaperEmbeddingCorpus._validate_rrf_weights(dense_weight, bm25_weight)
         ranked: dict[tuple[str, str], dict[str, Any]] = {}
-        for method, hits in (("dense", dense_hits), ("lexical", lexical_hits)):
+        for method, weight, hits in (
+            ("dense", dense_weight, dense_hits),
+            ("lexical", bm25_weight, lexical_hits),
+        ):
             for rank, hit in enumerate(hits, start=1):
                 identity = hit.metadata.get("chunk_id", hit.metadata.get("source_chunk_index"))
                 key = (hit.series, str(identity))
@@ -142,7 +335,7 @@ class PaperEmbeddingCorpus:
                     key,
                     {"hit": hit, "score": 0.0, "dense_rank": None, "lexical_rank": None},
                 )
-                row["score"] += 1.0 / (HYBRID_RRF_K + rank)
+                row["score"] += weight / (HYBRID_RRF_K + rank)
                 row[f"{method}_rank"] = rank
                 if method == "dense":
                     row["hit"] = hit
@@ -164,9 +357,18 @@ class PaperEmbeddingCorpus:
                 retrieval_method="hybrid",
                 dense_rank=row["dense_rank"],
                 lexical_rank=row["lexical_rank"],
+                anchor_series_score=row["hit"].anchor_series_score,
+                anchor_document_score=row["hit"].anchor_document_score,
+                anchor_chunk_score=row["hit"].anchor_chunk_score,
+                anchor_hierarchical_score=row["hit"].anchor_hierarchical_score,
             )
             for row in ordered
         ]
+
+    @staticmethod
+    def _validate_rrf_weights(dense_weight: float, bm25_weight: float) -> None:
+        if dense_weight < 0 or bm25_weight < 0 or not np.isclose(dense_weight + bm25_weight, 1.0):
+            raise ValueError("RRF dense and BM25 weights must be non-negative and sum to 1.")
 
     def build_lexical_index(self, output_path: Path) -> int:
         """Build the persistent BM25 index aligned to embedding metadata rows."""
@@ -253,13 +455,18 @@ class PaperEmbeddingCorpus:
         seed_hits: list[RetrievalHit],
         *,
         max_depth: int,
-        total_limit: int,
+        max_citation_chunks: int,
         chunks_per_heading: int,
-        query_embedding: np.ndarray | None = None,
+        facets: list[str],
+        facet_embeddings: np.ndarray,
+        min_gain: float,
         embed_many: Callable[[list[str]], list[list[float]]] | None = None,
         embedding_batch_size: int = 128,
+        selection_strategy: str = "gain",
+        query_embedding: np.ndarray | None = None,
+        query_text: str | None = None,
     ) -> tuple[list[RetrievalHit], list[CitationPath]]:
-        """Breadth-first expansion through precise in-text clause citations.
+        """Expand precise citations using facet gain or query-semantic BFS.
 
         Expansion deliberately reads raw chunk files rather than the active
         embedding selection. A cited target can therefore be in another local
@@ -267,269 +474,21 @@ class PaperEmbeddingCorpus:
         compatible. Citations lacking a target heading are ignored because
         they cannot be resolved to a defensible target clause.
         """
-        if (
-            max_depth < 0
-            or total_limit < len(seed_hits)
-            or chunks_per_heading < 1
-            or embedding_batch_size < 1
-        ):
-            raise ValueError("Invalid citation expansion limits")
-        selected = list(seed_hits[:total_limit])
-        selected_ids = {hit.metadata.get("chunk_id") for hit in selected if hit.metadata.get("chunk_id")}
-        paths: list[CitationPath] = []
-        frontier = list(selected)
-
-        for depth in range(1, max_depth + 1):
-            if len(selected) >= total_limit or not frontier:
-                break
-            if depth == 1:
-                depth_one_hits, depth_one_paths = self._select_depth_one_citations(
-                    frontier,
-                    selected_ids,
-                    total_limit - len(selected),
-                    chunks_per_heading,
-                    query_embedding,
-                    embed_many,
-                    embedding_batch_size,
-                )
-                selected.extend(depth_one_hits)
-                selected_ids.update(hit.metadata["chunk_id"] for hit in depth_one_hits)
-                paths.extend(depth_one_paths)
-                frontier = depth_one_hits
-                continue
-            next_frontier: list[RetrievalHit] = []
-            for parent in frontier:
-                if len(selected) >= total_limit:
-                    break
-                parent_chunk_id = parent.metadata.get("chunk_id")
-                if not isinstance(parent_chunk_id, str):
-                    continue
-                source_chunk = self._chunk_for_hit(parent)
-                for reference in source_chunk.get("references", []):
-                    if len(selected) >= total_limit:
-                        break
-                    if not isinstance(reference, dict):
-                        continue
-                    if reference.get("type") not in {"internal", "external"}:
-                        continue
-                    if not isinstance(reference.get("target_heading"), str):
-                        continue
-                    targets, status = self._resolve_target(reference)
-                    added_ids: list[str] = []
-                    for target, target_score in self._select_citation_targets(
-                        targets,
-                        query_embedding,
-                        embed_many,
-                        chunks_per_heading,
-                    ):
-                        chunk_id = target.get("chunk_id")
-                        if not isinstance(chunk_id, str) or chunk_id in selected_ids:
-                            continue
-                        target_file = reference.get("target_chunk_file")
-                        if not isinstance(target_file, str):
-                            continue
-                        metadata = {key: value for key, value in target.items() if key != "text"}
-                        hit = RetrievalHit(
-                            score=parent.score if target_score is None else target_score,
-                            series=str(target.get("series", reference.get("target_series", "unknown"))),
-                            text=target["text"],
-                            metadata=metadata,
-                            source_chunk_file=target_file,
-                            origin="citation",
-                            citation_depth=depth,
-                            parent_chunk_id=parent_chunk_id,
-                            citation=dict(reference),
-                            retrieval_method="citation",
-                        )
-                        selected.append(hit)
-                        next_frontier.append(hit)
-                        selected_ids.add(chunk_id)
-                        added_ids.append(chunk_id)
-                        if len(selected) >= total_limit:
-                            break
-                    if targets and not added_ids and status in RESOLVED_CITATION_STATUSES:
-                        status = "duplicate_target"
-                    paths.append(
-                        CitationPath(
-                            parent_chunk_id=parent_chunk_id,
-                            depth=depth,
-                            reference=dict(reference),
-                            status=status,
-                            target_chunk_ids=added_ids,
-                        )
-                    )
-            frontier = next_frontier
-        return selected, paths
-
-    def _select_depth_one_citations(
-        self,
-        seed_hits: list[RetrievalHit],
-        selected_ids: set[str],
-        available_slots: int,
-        chunks_per_heading: int,
-        query_embedding: np.ndarray | None,
-        embed_many: Callable[[list[str]], list[list[float]]] | None,
-        embedding_batch_size: int,
-    ) -> tuple[list[RetrievalHit], list[CitationPath]]:
-        """Choose depth-one citations globally by query relevance, not source order."""
-        references: list[tuple[RetrievalHit, dict[str, Any], str, list[dict[str, Any]], str]] = []
-        for parent in seed_hits:
-            parent_chunk_id = parent.metadata.get("chunk_id")
-            if not isinstance(parent_chunk_id, str):
-                continue
-            source_chunk = self._chunk_for_hit(parent)
-            for reference in source_chunk.get("references", []):
-                if not isinstance(reference, dict):
-                    continue
-                if reference.get("type") not in {"internal", "external"}:
-                    continue
-                if not isinstance(reference.get("target_heading"), str):
-                    continue
-                target_file = reference.get("target_chunk_file")
-                if not isinstance(target_file, str):
-                    continue
-                targets, status = self._resolve_target(reference)
-                references.append((parent, dict(reference), target_file, targets, status))
-
-        scored_targets = self._score_targets(
-            [
-                target
-                for _, _, _, targets, status in references
-                if status in RESOLVED_CITATION_STATUSES
-                for target in targets
-            ],
-            query_embedding,
-            embed_many,
-            embedding_batch_size,
+        return self._citation_expander.expand(
+            seed_hits,
+            max_depth=max_depth,
+            max_citation_chunks=max_citation_chunks,
+            chunks_per_heading=chunks_per_heading,
+            facets=facets,
+            facet_embeddings=facet_embeddings,
+            min_gain=min_gain,
+            embed_many=embed_many,
+            embedding_batch_size=embedding_batch_size,
+            selection_strategy=selection_strategy,
+            query_embedding=query_embedding,
+            query_text=query_text,
         )
-        candidate_groups: list[tuple[tuple[RetrievalHit, dict[str, Any], str, list[dict[str, Any]], str], list[_CitationCandidate]]] = []
-        order = 0
-        for reference_record in references:
-            parent, reference, target_file, targets, status = reference_record
-            candidates: list[_CitationCandidate] = []
-            ranked_targets = sorted(
-                targets,
-                key=lambda target: (
-                    -scored_targets.get(target.get("chunk_id"), parent.score),
-                    target.get("chunk_index_in_heading", 0),
-                ),
-            )[:chunks_per_heading]
-            for target in ranked_targets:
-                chunk_id = target.get("chunk_id")
-                if not isinstance(chunk_id, str) or chunk_id in selected_ids:
-                    continue
-                candidates.append(
-                    _CitationCandidate(
-                        parent=parent,
-                        reference=reference,
-                        target=target,
-                        target_file=target_file,
-                        score=scored_targets.get(chunk_id),
-                        order=order,
-                    )
-                )
-                order += 1
-            candidate_groups.append((reference_record, candidates))
 
-        best_candidates: dict[str, _CitationCandidate] = {}
-        for _, candidates in candidate_groups:
-            for candidate in candidates:
-                chunk_id = candidate.target["chunk_id"]
-                existing = best_candidates.get(chunk_id)
-                candidate_score = candidate.score if candidate.score is not None else candidate.parent.score
-                existing_score = existing.score if existing and existing.score is not None else (existing.parent.score if existing else None)
-                if existing is None or candidate_score > existing_score or (
-                    candidate_score == existing_score and candidate.order < existing.order
-                ):
-                    best_candidates[chunk_id] = candidate
-
-        ranked_candidates = sorted(
-            best_candidates.values(),
-            key=lambda candidate: (
-                -(candidate.score if candidate.score is not None else candidate.parent.score),
-                candidate.order,
-            ),
-        )[:available_slots]
-        selected_candidates = {candidate.target["chunk_id"]: candidate for candidate in ranked_candidates}
-        hits = [
-            RetrievalHit(
-                score=candidate.parent.score if candidate.score is None else candidate.score,
-                series=str(candidate.target.get("series", candidate.reference.get("target_series", "unknown"))),
-                text=candidate.target["text"],
-                metadata={key: value for key, value in candidate.target.items() if key != "text"},
-                source_chunk_file=candidate.target_file,
-                origin="citation",
-                citation_depth=1,
-                parent_chunk_id=candidate.parent.metadata["chunk_id"],
-                citation=candidate.reference,
-                retrieval_method="citation",
-            )
-            for candidate in ranked_candidates
-        ]
-        paths: list[CitationPath] = []
-        for (parent, reference, _, targets, status), candidates in candidate_groups:
-            added_ids = [
-                candidate.target["chunk_id"]
-                for candidate in candidates
-                if selected_candidates.get(candidate.target["chunk_id"]) == candidate
-            ]
-            if status in RESOLVED_CITATION_STATUSES and not added_ids:
-                status = "not_selected_by_query_score" if candidates else "duplicate_target"
-            paths.append(
-                CitationPath(
-                    parent_chunk_id=parent.metadata["chunk_id"],
-                    depth=1,
-                    reference=reference,
-                    status=status,
-                    target_chunk_ids=added_ids,
-                )
-            )
-        return hits, paths
-
-    @staticmethod
-    def _score_targets(
-        targets: list[dict[str, Any]],
-        query_embedding: np.ndarray | None,
-        embed_many: Callable[[list[str]], list[list[float]]] | None,
-        batch_size: int,
-    ) -> dict[str, float]:
-        if query_embedding is None or embed_many is None:
-            return {}
-        unique_targets = {
-            target["chunk_id"]: target
-            for target in targets
-            if isinstance(target.get("chunk_id"), str) and isinstance(target.get("text"), str)
-        }
-        query = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
-        scores: dict[str, float] = {}
-        target_items = list(unique_targets.items())
-        for start in range(0, len(target_items), batch_size):
-            batch = target_items[start : start + batch_size]
-            vectors = np.asarray(embed_many([target["text"] for _, target in batch]), dtype=np.float32)
-            if vectors.shape != (len(batch), query.shape[0]):
-                raise ValueError("Citation target embeddings do not match the query embedding shape.")
-            scores.update({chunk_id: float(vector @ query) for (chunk_id, _), vector in zip(batch, vectors, strict=True)})
-        return scores
-
-    @staticmethod
-    def _select_citation_targets(
-        targets: list[dict[str, Any]],
-        query_embedding: np.ndarray | None,
-        embed_many: Callable[[list[str]], list[list[float]]] | None,
-        limit: int,
-    ) -> list[tuple[dict[str, Any], float | None]]:
-        """Preserve small clauses, but rank oversized cited clauses against the query."""
-        if len(targets) <= limit or query_embedding is None or embed_many is None:
-            return [(target, None) for target in targets[:limit]]
-
-        texts = [target["text"] for target in targets]
-        vectors = np.asarray(embed_many(texts), dtype=np.float32)
-        query = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
-        if vectors.shape != (len(targets), query.shape[0]):
-            raise ValueError("Citation target embeddings do not match the query embedding shape.")
-        scores = vectors @ query
-        ranked_indices = sorted(range(len(targets)), key=lambda index: (-float(scores[index]), index))
-        return [(targets[index], float(scores[index])) for index in ranked_indices[:limit]]
 
     def _load_metadata(self, filename: str) -> list[dict[str, Any]]:
         if filename not in self._metadata_cache:

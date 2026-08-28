@@ -2,14 +2,30 @@
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Protocol
 
 from newbaseline.src.embeddings import EmbeddingProvider
 from newbaseline.src.settings import require_secret
 
 
+RELEASE_TAG_PATTERN = re.compile(r"\s*\[\s*3GPP\s+Release\s+\d+\s*\]\s*", re.IGNORECASE)
+RELEASE_MENTION_PATTERN = re.compile(
+    r"\b(?:according\s+to\s+|under\s+|in\s+|for\s+|from\s+|within\s+)?"
+    r"(?:the\s+)?(?:3GPP\s+)?Release\s+\d+\b",
+    re.IGNORECASE,
+)
+TRAILING_METADATA_PATTERN = re.compile(
+    r"(?:\b(?:according\s+to|under|in|for|from|within|of|the|context\s+of|reference\s+to)\b\s*)+$",
+    re.IGNORECASE,
+)
+
+
 class RagClient(Protocol):
     def rephrase(self, question: str) -> str: ...
+
+    def extract_facets(self, question: str) -> list[str]: ...
 
     def embed(self, text: str) -> list[float]: ...
 
@@ -58,6 +74,7 @@ class OpenAICompatibleRagClient:
         return options
 
     def rephrase(self, question: str) -> str:
+        """Keep the original rephrase-only retrieval prompt."""
         response = self._client.chat.completions.create(
             model=self._rephrase_model,
             messages=[
@@ -69,6 +86,56 @@ class OpenAICompatibleRagClient:
             **self._completion_options(),
         )
         return (response.choices[0].message.content or question).strip()
+
+    def extract_facets(self, question: str) -> list[str]:
+        """Extract citation-scoring needs without changing the retrieval query."""
+        clean_question = RELEASE_TAG_PATTERN.sub(" ", question).strip()
+        response = self._client.chat.completions.create(
+            model=self._rephrase_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Extract answer-bearing needs only for scoring evidence cited by retrieved chunks. "
+                        "These facets will not be used as a retrieval query. Return one JSON object with exactly:\n"
+                        '- "facets": the smallest list of information needs required to answer the question.\n\n'
+                        "A facet must describe what the answer must establish, including the relevant entity, "
+                        "relation, condition, action, or quantity. Do not output isolated entities, acronyms, "
+                        "broad topic labels, release numbers, document names, standards, provenance, or phrases "
+                        "such as 'according to 3GPP'. Return no more than four facets. If the question asks for "
+                        "one relation, property, condition, action, or quantity, return exactly one facet. "
+                        "Do not answer the question and do not invent information.\n\n"
+                        f"Question:\n{clean_question}"
+                    ),
+                }
+            ],
+            response_format={"type": "json_object"},
+            **self._completion_options(),
+        )
+        content = (response.choices[0].message.content or "").strip()
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            return [clean_question]
+        if not isinstance(payload, dict):
+            return [clean_question]
+        raw_facets = payload.get("facets")
+        facets: list[str] = []
+        if isinstance(raw_facets, list):
+            for raw_facet in raw_facets:
+                if not isinstance(raw_facet, str):
+                    continue
+                facet = RELEASE_TAG_PATTERN.sub(" ", raw_facet)
+                facet = RELEASE_MENTION_PATTERN.sub(" ", facet)
+                facet = TRAILING_METADATA_PATTERN.sub("", facet)
+                facet = re.sub(r"\s+", " ", facet).strip(" ,;:-")
+                if facet and facet not in facets:
+                    facets.append(facet)
+                if len(facets) == 4:
+                    break
+        if not facets:
+            facets = [clean_question]
+        return facets
 
     def embed(self, text: str) -> list[float]:
         return self.embed_many([text])[0]

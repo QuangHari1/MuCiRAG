@@ -94,6 +94,26 @@ class SqliteBm25Index:
             rows = connection.execute(sql, [query, *selected_series, top_k]).fetchall()
         return [(str(series), int(metadata_index), float(score)) for series, metadata_index, score in rows]
 
+    def search_chunk_ids(self, query_text: str, chunk_ids: list[str]) -> list[tuple[str, float]]:
+        """Rank an explicit citation-candidate set with the persistent BM25 index."""
+        if not chunk_ids:
+            return []
+        query = lexical_query(query_text)
+        if query is None:
+            return []
+        unique_chunk_ids = list(dict.fromkeys(chunk_ids))
+        placeholders = ",".join("?" for _ in unique_chunk_ids)
+        sql = f"""
+            SELECT chunk_id, bm25(chunks, 0.0, 0.0, 0.0, 2.0, 1.0)
+            FROM chunks
+            WHERE chunks MATCH ? AND chunk_id IN ({placeholders})
+            ORDER BY bm25(chunks, 0.0, 0.0, 0.0, 2.0, 1.0), rowid
+        """
+        uri = f"file:{self.path.resolve()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as connection:
+            rows = connection.execute(sql, [query, *unique_chunk_ids]).fetchall()
+        return [(str(chunk_id), float(score)) for chunk_id, score in rows]
+
 
 def build_bm25_index(
     path: Path,

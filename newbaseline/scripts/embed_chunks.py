@@ -32,8 +32,8 @@ DIMENSIONS = SETTINGS.get("embedding", "dimensions")
 DEFAULT_BATCH_SIZE = SETTINGS.get("embedding", "batch_size")
 
 WORKSPACE_ROOT = SETTINGS.workspace_root
-CHUNK_DIR = SETTINGS.dataset_dir / "3gpp" / "Chunk" / f"Rel-{SETTINGS.release}"
-OUTPUT_DIR = SETTINGS.dataset_dir / "3gpp" / "Embeddings" / f"Rel-{SETTINGS.release}"
+CHUNK_DIR = SETTINGS.chunk_dir
+OUTPUT_DIR = SETTINGS.embedding_dir
 PARTIAL_DIR = OUTPUT_DIR / ".partial"
 MANIFEST_PATH = OUTPUT_DIR / "manifest.json"
 SERIES_PATTERN = re.compile(r"^ChunkSeries(?P<series>\d+)\.json$")
@@ -82,6 +82,8 @@ def chunk_sources(selected_series: set[str] | None) -> list[tuple[str, Path]]:
         series = match.group("series")
         if selected_series is None or series in selected_series:
             sources.append((series, path))
+    # The four paper summaries are not numeric 3GPP series, so keep them in a
+    # named pseudo-series and include them only when the selection asks for it.
     summary_path = CHUNK_DIR / SETTINGS.get("paper_release_summaries", "chunk_file")
     if summary_path.exists() and (selected_series is None or SUMMARY_SOURCE_ID in selected_series):
         sources.append((SUMMARY_SOURCE_ID, summary_path))
@@ -172,9 +174,7 @@ def configure_output(selection_id: str) -> None:
     if not SELECTION_ID_PATTERN.fullmatch(selection_id):
         raise ValueError(f"Invalid selection_id: {selection_id}")
     global OUTPUT_DIR, PARTIAL_DIR, MANIFEST_PATH
-    OUTPUT_DIR = (
-        WORKSPACE_ROOT / "dataset" / "3gpp" / "Embeddings" / "Rel-18" / selection_id
-    )
+    OUTPUT_DIR = SETTINGS.embedding_root(selection_id)
     PARTIAL_DIR = OUTPUT_DIR / ".partial"
     MANIFEST_PATH = OUTPUT_DIR / "manifest.json"
 

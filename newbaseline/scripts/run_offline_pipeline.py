@@ -8,12 +8,13 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = PROJECT_ROOT / "newbaseline" / "scripts"
+NEWBASELINE_ROOT = PROJECT_ROOT / "newbaseline"
+SCRIPTS_DIR = NEWBASELINE_ROOT / "scripts"
 
 
 def run(command: list[str]) -> None:
     print("+", " ".join(command), flush=True)
-    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    subprocess.run(command, cwd=NEWBASELINE_ROOT, check=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,7 +22,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("paper", "full"), required=True)
     parser.add_argument("--selection", type=Path, help="Reuse an existing selection JSON instead of regenerating it.")
     parser.add_argument("--embed", action="store_true", help="Run paid embedding calls after chunking.")
-    parser.add_argument("--dry-run", action="store_true", help="With --embed, validate chunk counts without calling the provider.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "With --embed, rebuild headings/chunks then validate embedding inputs without calling the provider. "
+            "Use embed_chunks.py directly to inspect an already-built corpus."
+        ),
+    )
     parser.add_argument("--series", action="append", help="Pass one or more numeric series to the embedding stage.")
     args = parser.parse_args()
     if args.dry_run and not args.embed:

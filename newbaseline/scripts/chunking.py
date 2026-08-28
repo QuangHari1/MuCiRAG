@@ -19,10 +19,10 @@ from newbaseline.src.corpus import SourceDocument, discover_source_documents, lo
 SETTINGS = load_settings()
 WORKSPACE_ROOT = SETTINGS.workspace_root
 RAW_ROOT = SETTINGS.release_dir
-METADATA_ROOT = SETTINGS.dataset_dir / "3gpp" / "Metadata" / f"Rel-{SETTINGS.release}"
+METADATA_ROOT = SETTINGS.metadata_dir
 
-CHUNK_OUTPUT_ROOT = SETTINGS.dataset_dir / "3gpp" / "Chunk" / f"Rel-{SETTINGS.release}"
-REFERENCE_OUTPUT_ROOT = SETTINGS.dataset_dir / "3gpp" / "Reference" / f"Rel-{SETTINGS.release}"
+CHUNK_OUTPUT_ROOT = SETTINGS.chunk_dir
+REFERENCE_OUTPUT_ROOT = SETTINGS.reference_dir
 
 PREFERRED_SOURCE_NAME = SETTINGS.get("chunking", "preferred_source_name")
 FALLBACK_SOURCE_NAME = SETTINGS.get("chunking", "fallback_source_name")
@@ -43,9 +43,7 @@ def find_source_files(root: Path, selected_document_keys: set[str] | None = None
     """
     Find exactly one source markdown file per document folder.
 
-    Priority:
-        1. raw_image_table_verbalized.md
-        2. raw.md
+    The source filename is selected by ``[chunking]`` in ``config.toml``.
     """
 
     return discover_source_documents(
@@ -1584,6 +1582,15 @@ def main():
                 f"{source_document.path}: "
                 f"{e}"
             )
+
+    # A partial Chunk/Reference pair looks valid to later embedding and BFS
+    # stages, but silently omits documents.  Refuse publication until every
+    # selected document supplied usable heading metadata and chunked cleanly.
+    if failed or skipped:
+        raise RuntimeError(
+            f"Refusing to publish partial corpus: success={success}, "
+            f"failed={failed}, skipped={skipped}"
+        )
 
     # ========================================================
     # CREATE OUTPUT FOLDERS

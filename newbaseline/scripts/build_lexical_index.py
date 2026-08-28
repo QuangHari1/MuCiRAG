@@ -26,13 +26,7 @@ def parse_args(default_output: Path) -> argparse.Namespace:
 
 def main() -> None:
     settings = load_settings()
-    embedding_root = (
-        settings.dataset_dir
-        / "3gpp"
-        / "Embeddings"
-        / f"Rel-{settings.release}"
-        / settings.get("rag", "selection_id")
-    )
+    embedding_root = settings.embedding_root(settings.get("rag", "selection_id"))
     default_output = embedding_root / settings.get("rag", "lexical_index_file")
     args = parse_args(default_output)
     if args.overwrite:

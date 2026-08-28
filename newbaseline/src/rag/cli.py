@@ -25,12 +25,27 @@ def main() -> int:
         return 0
     if result.answer:
         print(result.answer)
-    print("\nRouter selected:", ", ".join(result.router_selected_series))
+    print("\nAnchor strategy:", result.anchor_strategy)
+    if result.anchor_strategy == "router":
+        print("Router selected:", ", ".join(result.router_selected_series))
     if result.empty_selected_series:
         print("Empty selected:", ", ".join(result.empty_selected_series))
     print("Searched:", ", ".join(result.searched_series))
     for hit in result.retrievals:
-        print(f"\n[{hit.series}] score={hit.score:.4f} {hit.metadata.get('document_name', '')}")
+        citation_note = ""
+        if hit.origin == "citation":
+            max_gain = hit.citation_gain or 0.0
+            total_gain = hit.citation_total_gain or 0.0
+            citation_note = (
+                f" citation_gain={max_gain:.4f}"
+                f" total_facet_gain={total_gain:.4f}"
+                f" parent={hit.parent_chunk_id}"
+                f" facets={list(hit.citation_facets)}"
+            )
+        print(
+            f"\n[{hit.series}] origin={hit.origin} score={hit.score:.4f}{citation_note} "
+            f"{hit.metadata.get('document_name', '')}"
+        )
         print(hit.text[:500])
     return 0
 

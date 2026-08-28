@@ -100,6 +100,8 @@ def extract_abbreviations(path: Path, input_root: Path, release: str) -> list[di
 
 def build_catalog(input_root: Path, release: str) -> dict[str, Any]:
     """Aggregate equal acronym/expansion rows while retaining every source."""
+    # Use raw.md deliberately: this catalog records standard-source wording,
+    # independent of any optional image/table verbalization used for chunks.
     files = sorted(input_root.glob("*_series/*/raw.md"))
     grouped: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     source_rows = 0

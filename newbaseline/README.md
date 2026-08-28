@@ -52,6 +52,9 @@ at runtime. Keep it only if you want to rebuild chunks or embeddings. Do not
 move individual files out of the paths above: the manifest and configuration
 refer to them.
 
+Enhanced experiments live outside the baseline tree; see
+[DATASET_LAYOUT.md](DATASET_LAYOUT.md) for the required isolated layout.
+
 ## 1. Set the API key
 
 For the default OpenAI configuration, create `newbaseline/.env`:
@@ -60,7 +63,7 @@ For the default OpenAI configuration, create `newbaseline/.env`:
 OPENAI_API_KEY=sk-...
 ```
 
-The key is used for query embeddings and the two LLM calls. It is never stored
+The key is used for embeddings and the three LLM calls (rephrase, facets, and answer). It is never stored
 in result files, manifests, or the Docker image.
 
 To use a different compatible LLM, edit only `[llm]` and the two model names
@@ -69,7 +72,8 @@ intend to regenerate the entire embedding corpus.
 
 ## 2. Install and verify locally
 
-Install [uv](https://docs.astral.sh/uv/) and Python 3.11, then:
+All host-side script commands below run from `newbaseline/`. Install
+[uv](https://docs.astral.sh/uv/) and Python 3.11, then:
 
 ```bash
 cd newbaseline
@@ -147,58 +151,16 @@ comparison is wanted.
 Questions with no expected option are saved but marked `unscored`; they do not
 contribute to accuracy or comparisons.
 
-## Results and error analysis
+## Results
 
 Each benchmark JSONL row stores the answer, expected/predicted option,
 correctness, router decision, hybrid retrieval ranks, and citation paths.
 The full retrieved text is intentionally not repeated in every row.
 
-Generate error-analysis tables and a readable summary:
-
-```bash
-uv run \
-  scripts/analyze_teleqna_errors.py \
-  --results results/teleqna/my-change-tail200.jsonl \
-  --output-dir results/analysis/my-change-tail200
-```
-
-Read `results/analysis/my-change-tail200/summary.md` first. The directory also
-contains CSV/JSON breakdowns for wrong answers, semantic scores, router series,
-and citation paths.
-
 MLflow is local by default. Every benchmark records its config, progress/final
-metrics, result JSONL, manifest, comparison, and available analysis files under
+metrics, result JSONL, manifest, and comparison files under
 `results/mlflow/`; no account or cloud upload is needed. Set
 `[experiment_tracking].mode = "disabled"` in `config.toml` to turn this off.
-
-## Release-18 reference-link statistics
-
-To analyse the **full GSMA Release-18 corpus** (all local `raw.md` files, not
-the paper's 553-document selection), run:
-
-```bash
-uv run scripts/analyze_release18_references.py
-```
-
-This writes `results/release18-reference-stats/release18_reference_statistics.pdf`
-and a JSON audit file next to it.  The report counts distinct 3GPP/ETSI TS/TR
-targets found in each document's References section, excludes self-links, and
-separately reports targets that are present in the full local GSMA Rel-18
-corpus.  The JSON records every extracted source/target relation for audit.
-
-To browse runs locally, keep this command running in a second terminal from
-`newbaseline/`, then open <http://127.0.0.1:5000>:
-
-```bash
-uv run scripts/mlflow_ui.py
-```
-
-To import pre-existing JSONL checkpoints into the same UI once:
-
-```bash
-uv run \
-python scripts/import_teleqna_results_to_mlflow.py
-```
 
 ## Changing retrieval settings
 
@@ -209,18 +171,80 @@ and rerun tail-200. The benchmark manifest captures these settings.
 [rag]
 retrieval_backend = "hybrid"
 retrieval_top_k = 8          # final dense + BM25 seed chunks
+rrf_dense_weight = 0.5       # use 0.7 / 0.3 for dense-heavy fusion
+rrf_bm25_weight = 0.5
+anchor_strategy = "router"   # "router" (existing) or "hierarchical"
+citation_strategy = "gain"   # "gain", "semantic_bfs", or "rrf_bfs"
 citation_max_depth = 1       # follow citations one hop only
-citation_total_chunks = 12   # 8 seeds + at most 4 cited chunks
+citation_min_gain = 0.01     # minimum marginal facet-coverage gain
+citation_max_chunks = 4      # ceiling, not a forced citation count
 citation_chunks_per_heading = 1
 ```
+
+`anchor_strategy = "router"` preserves the existing `paper_nn` or semantic
+series router. `anchor_strategy = "hierarchical"` skips that filter and ranks
+every chunk in the active embedding manifest by `0.1 * series + 0.1 * document
++ 0.8 * chunk` semantic similarity. With hybrid retrieval this only replaces
+the dense ranking; BM25 and RRF remain unchanged.
+
+Before enabling hierarchical anchors, prepare its selection-specific artifact
+once. This is intentionally a separate paid embedding step; benchmark runs only
+read the resulting files and fail if their selection/model provenance differs.
+
+```bash
+uv run python scripts/embed_anchor_hierarchy.py
+```
+
+The script derives each document description from its title and `Scope` clause,
+embeds document and series descriptions in batches, and writes the vectors,
+descriptions, and provenance manifest next to the active corpus embeddings.
+Use `--force` only when deliberately replacing an incompatible artifact after a
+corpus or embedding-model change.
 
 For each question, dense retrieval and BM25 each produce up to 32 candidates
 (`4 * retrieval_top_k`). Reciprocal Rank Fusion with `k = 60` combines their
 rankings and keeps the best 8, without comparing incompatible dense and BM25
-scores or introducing a learned weight. Citation expansion then follows exact
-resolved heading links from those seeds, globally ranks the targets against the
-query, and adds at most 4. One target chunk per heading avoids near-duplicate
-context; depth 1 avoids citation-chain drift.
+scores or introducing a learned weight. After seed retrieval is complete, a
+separate call creates a minimal list of answer-bearing facets. Facets never enter
+the router, dense query, or BM25 query. Citation expansion follows exact resolved
+heading links and measures how much a target increases facet coverage beyond the
+exact parent chunk that cites it. If several seeds cite the same target, their
+edges are scored separately and the selected target keeps the best parent path.
+Only targets with marginal gain at least 0.01 are added, up to 4 chunks. One
+target chunk per heading avoids near-duplicate context; depth 1 avoids
+citation-chain drift.
+
+`rrf_dense_weight` and `rrf_bm25_weight` apply to both hybrid seed retrieval
+and `rrf_bfs` citation selection; they must be non-negative and sum to `1.0`.
+For example, `0.7 / 0.3` favors semantic matches, while `0.3 / 0.7` favors
+exact lexical terminology. The default `0.5 / 0.5` preserves equal-rank fusion.
+
+Set `citation_strategy = "semantic_bfs"` to run the earlier citation baseline.
+It follows the same precise citation graph breadth-first, ranks cited target
+chunks by similarity to the enriched rephrased query, and keeps up to
+`citation_max_chunks`. This strategy does not generate facets and ignores
+`citation_min_gain`; the manifest and trace record `semantic_bfs` plus each
+selected chunk's semantic score. Switch back to `gain` to use parent-local
+facet evidence gain.
+
+Set `citation_strategy = "rrf_bfs"` to keep the same breadth-first traversal
+but fuse dense and BM25 ranks within the citation targets available at each
+depth. It uses the enriched rephrased query for both ranks, RRF with `k = 60`,
+and records dense rank, lexical rank, semantic score, and RRF score for each
+selected citation. This requires `retrieval_backend = "hybrid"` and its lexical
+index; it does not change the seed retrieval policy.
+
+Seed chunks keep the same context format as the hybrid baseline. Selected
+citations are appended after every seed and use the neutral label
+`Referenced candidate`, together with the exact parent-to-target path. Facets
+and numerical gain remain in the benchmark trace for analysis rather than
+being asserted as evidence to the answer model.
+
+Each TeleQnA JSONL row contains `trace.citation_debug`. Selected citations
+include their full chunk text, parent-to-target path, max marginal gain, total
+facet gain, per-facet gains, and facet coverage before/after selection. The
+decision list also records candidate IDs, best candidate gain, and statuses such
+as `below_min_gain`, `not_selected_by_gain`, or `duplicate_target`.
 
 Changing `rephrase_model`, `answer_model`, temperature, retrieval limits, or
 citation settings does **not** require re-embedding. Changing `[embedding]`
@@ -275,22 +299,39 @@ docker run --rm -it \
   newbaseline/scripts/run_teleqna_benchmark.py --limit 1
 ```
 
-## Rebuild the corpus (optional)
+## Rebuild the corpus from a source-only dataset (optional)
 
-Only do this when prepared artifacts are absent or you deliberately changed
-the embedding model/corpus. It downloads data and embedding requires paid API
-calls, so it is not part of normal benchmark reproduction.
+Only do this when the image/release supplies raw source files but not prepared
+chunks and vectors, or when deliberately changing the corpus or embedding
+model. A source-only release must include the Release-18 `raw.md` tree, the
+paper selection mapping, and the four release-summary DOCX files. Embedding
+uses the configured paid API, so it is not part of normal benchmark
+reproduction.
 
-From the repository root:
+From `newbaseline/`, run the stages in this order:
 
 ```bash
-uv run --project newbaseline \
-  newbaseline/scripts/run_offline_pipeline.py --mode paper
+cd newbaseline
 
-uv run --project newbaseline \
-  newbaseline/scripts/run_offline_pipeline.py --mode paper --embed --dry-run
+# Skip when dataset/teleqna/TeleQnA.json was supplied with the image.
+uv run python scripts/prepare_teleqna.py
+
+# Selection -> headings -> chunks -> release-summary chunks.
+uv run python scripts/run_offline_pipeline.py --mode paper
+
+# Check the paid embedding workload without sending requests.
+uv run python scripts/run_offline_pipeline.py --mode paper --embed --dry-run
+
+# Create/resume vectors only after approving the embedding cost.
+uv run python scripts/run_offline_pipeline.py --mode paper --embed
+
+# Build the local BM25 index after vectors and chunks exist.
+uv run python scripts/build_lexical_index.py
 ```
 
-Run the final command again with `--embed` (without `--dry-run`) only when you
-intend to create or resume paid embeddings. The paper selection covers 549
-Release-18 specifications plus the four Rel-14--Rel-17 summary documents.
+The paper selection covers 549 Release-18 specifications plus the four
+Rel-14--Rel-17 summary documents. If using hierarchical retrieval, run
+`uv run python scripts/embed_anchor_hierarchy.py` after the embedding stage.
+For a prepared Docker dataset, none of these rebuild commands are needed:
+only run `build_lexical_index.py` if `lexical.sqlite3` was intentionally left
+out, then use `run_teleqna_benchmark.py`.
