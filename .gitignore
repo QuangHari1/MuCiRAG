@@ -58,3 +58,28 @@
 **/.codegraph/
 **/.codex/
 **/.agents/
+.codex
+.codegraph
+
+# Local Docker build and deployment files
+**/Dockerfile
+**/Dockerfile.*
+**/*.Dockerfile
+**/.dockerignore
+**/docker-compose*.yml
+**/docker-compose*.yaml
+**/compose.yml
+**/compose.yaml
+**/compose.*.yml
+**/compose.*.yaml
+
+# Local artifact builders; reproduction uses the pinned Hugging Face bundle
+/MuCiRAG/scripts/prepare_embedding_selection.py
+/MuCiRAG/scripts/extract_heading.py
+/MuCiRAG/scripts/chunking.py
+/MuCiRAG/scripts/chunk_paper_release_summaries.py
+/MuCiRAG/scripts/embed_chunks.py
+/MuCiRAG/scripts/embed_anchor_hierarchy.py
+/MuCiRAG/scripts/build_lexical_index.py
+/MuCiRAG/scripts/build_release18_vocabulary.py
+/MuCiRAG/scripts/run_offline_pipeline.py

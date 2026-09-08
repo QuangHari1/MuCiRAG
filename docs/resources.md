@@ -46,9 +46,10 @@ bằng commit SHA cuối cùng. Không dùng `main` để pin một kết quả 
 row/chunk ID, selected-chunk digest, giá trị finite, anchor provenance và SQLite
 integrity. Đây là kiểm tra offline, không gọi model.
 
-## Tạo lại từ nguồn
+## Rebuilding artifacts
 
-Bundle đủ để chạy artifacts đã chuẩn bị. Khi thay chunking hoặc muốn tạo lại
-artifacts từ tài liệu gốc, tải source theo revision ghi trong dataset card và
-làm theo [thứ tự preprocessing](../MuCiRAG/scripts/README.md).
-Bộ 1.840 câu được dùng nguyên snapshot trong bundle.
+The published checkout reproduces runs with the pinned prepared bundle.
+Artifact-building scripts and raw documents are kept locally and excluded from
+Git. Rebuilding from source requires those local scripts and the upstream
+sources identified in the dataset card. See the
+[repository README](../README.md) for the scope of this release.

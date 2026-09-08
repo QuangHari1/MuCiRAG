@@ -42,9 +42,13 @@ Giới hạn `citation_max_chunks` áp dụng **mỗi độ sâu**. `citation_ma
 hoặc `citation_max_chunks = 0` tắt mở rộng. Seed retrieval và mở rộng citation
 là hai bước riêng; đổi citation strategy không đổi công thức xếp hạng seed.
 
-## Offline: tạo artifacts
+## Offline: tạo artifacts (chỉ giữ local)
 
-Các script trong `MuCiRAG/scripts/` được chia theo nhiệm vụ:
+Các script tạo artifacts dưới đây chỉ giữ local và được ignore khỏi Git.
+Bản checkout công bố dùng tài nguyên đã pin trên Hugging Face; chỉ
+`manage_assets.py` và benchmark runner được giữ trong `scripts/`.
+
+Các script local được chia theo nhiệm vụ:
 
 | Nhóm | Script |
 | --- | --- |
