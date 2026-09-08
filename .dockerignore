@@ -1,6 +1,3 @@
-# The retained paper implementation is intentionally not part of this image.
-Telco-RAG_api/
-
 # Local development state and secrets.
 .git/
 .codegraph/
@@ -10,11 +7,33 @@ backup/
 **/__pycache__/
 **/*.py[cod]
 **/.pytest_cache/
-newbaseline/.venv/
-newbaseline/.env
+MuCiRAG/.venv/
+MuCiRAG/.env
 .env
+**/.env.*
+!MuCiRAG/.env.example
+assets-manifest.json
 
-# Rebuildable caches/checkpoints. Completed vectors and all experiment outputs
-# remain in the image so the reported experiments can be inspected offline.
+# Rebuildable local state. The baseline corpus artifacts below are intentionally
+# retained, but historical benchmark/MLflow outputs are not part of a clean,
+# reproducible image.
+MuCiRAG/results/
+MuCiRAG/mlflow.db
+MuCiRAG/.ruff_cache/
+MuCiRAG/.mypy_cache/
 dataset/**/.cache/
 dataset/3gpp/Embeddings/**/.partial/
+
+# The default config is baseline-only and never reads this experimental profile.
+# It is substantially larger than the prepared baseline corpus and would make
+# the image non-reproducible for the checked-in configuration.
+dataset/3gpp-enhanced/
+
+# Runtime-only resource bundle: raw sources and intermediates are optional.
+dataset/3gpp/marked/
+dataset/3gpp/Metadata/
+dataset/3gpp/Reference/
+dataset/3gpp/paper_release_summaries/
+dataset/3gpp/paper_baseline_documents.json
+dataset/3gpp/paper_gsma_rel18_mapping.json
+dataset/3gpp/embedding_selections/full-gsma-rel18.json

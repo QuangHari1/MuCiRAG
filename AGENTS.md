@@ -1,26 +1,49 @@
 # Repository Guidelines
 
-## Repository layout
+## MuCiRAG
 
-This repository contains two independent RAG baselines.
+This repository contains the MuCiRAG research implementation. Source code and entry points live in `MuCiRAG/`. The old `Telco-RAG_api/` implementation has been removed.
 
-- `Telco-RAG_api/` is the cloned and adapted Telco-oRAG paper baseline. Its Python code is in `src/`, `api/`, `scripts/`, `experiments/`, and `Telco-RAG_paper_version/`. `frontend/` is the original Next.js client retained for reference only.
-- `newbaseline/` is the clean workspace for the new implementation. Put its source in `newbaseline/src/`, tests in `newbaseline/tests/`, and runnable helpers in `newbaseline/scripts/`.
+- Python source: `MuCiRAG/src/`.
+- Offline preparation and evaluation helpers: `MuCiRAG/scripts/`.
+- Result reports and figures: `MuCiRAG/analysis/`.
+- Shared checkpoint readers: `MuCiRAG/src/evaluation/records.py`.
+- Optional operational helpers: `MuCiRAG/tools/`.
+- Tests: `MuCiRAG/tests/`.
+- Root command dispatcher: `mucirag.py`.
+- User documentation: `README.md` and `docs/`.
+- Data and resources: downloaded from a versioned Hugging Face bundle; never
+  commit corpora, vectors, `.env`, virtual environments, or benchmark results.
 
-Do not mix implementation code between the two baselines. It is fine to read `Telco-RAG_api/` for ideas, but the new baseline must own its dependencies, entry points, tests, and evaluation logic.
+## Validation
 
-## Commands and validation
-
-The paper baseline uses Python 3.11 and its existing benchmark is run from `Telco-RAG_api/`:
+Use Python 3.11 and the existing `MuCiRAG/uv.lock`.
 
 ```bash
-.venv/bin/python scripts/run_teleqna_benchmark.py --dataset datasets/TeleQnA.json --limit 1
+uv sync --project MuCiRAG --frozen
+uv run --project MuCiRAG python -m pytest MuCiRAG/tests -q
+python3 -m compileall -q MuCiRAG/src MuCiRAG/scripts mucirag.py
+git diff --check
 ```
 
-Before changing that code, run `python3 -m compileall -q Telco-RAG_api` and `git diff --check`. Treat live provider execution, local benchmark execution, and static validation as separate results.
+Offline resource validation:
 
-For `newbaseline/`, add focused tests and its dependency setup with the first implementation. Keep test data small and never commit API keys, downloaded 3GPP data, virtual environments, or generated benchmark results.
+```bash
+uv run --project MuCiRAG python mucirag.py assets validate
+```
 
-## Style
+Live LLM execution, paid embedding generation, offline tests, and static
+validation are separate results. Never present one as evidence for another.
 
-Use Python 4-space indentation, `snake_case` functions/modules, and `PascalCase` classes. Keep route handlers thin and make retrieval/evaluation behavior explicit and testable. Make changes narrowly scoped to one baseline unless shared documentation is being updated.
+## Refactoring contracts
+
+Use Python 4-space indentation, snake_case functions/modules and PascalCase
+classes. Keep pipeline orchestration in `rag/service.py`, retrieval in
+`rag/corpus.py`, pure ranking in `rag/ranking.py`, and citation traversal in
+`rag/citation_expansion.py`. Prefer small named stages with clear input/output.
+
+Preserve prompts, provider/model routing, original versus enriched query use,
+ranking/tie-breaking, context order, result schema and checkpoint semantics
+unless explicitly changing an experiment. Keep old results and config values
+intact during readability refactors. Test behavior with small fake clients and
+corpora. Use a fresh result path when experimental conditions change.

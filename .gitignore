@@ -1,35 +1,60 @@
-# Python caches
+# Credentials and machine-local configuration
+.env
+.env.*
+!**/.env.example
+*.pem
+*.toml
+!/MuCiRAG/pyproject.toml
+!/MuCiRAG/config.toml
+!/MuCiRAG/resources.lock.toml
+
+# Downloaded data, prepared resources, and release staging
+/dataset/
+/datasets/
+/MuCiRAG/resources/
+/MuCiRAG/dataset/
+/MuCiRAG/datasets/
+/assets-manifest.json
+/.cache/
+/artifacts/
+
+# Experiment outputs and backups (keep locally, never publish with code)
+/backup/
+**/results/
+**/outputs/
+/MuCiRAG/analysis/*.json
+/MuCiRAG/analysis/*.jsonl
+/MuCiRAG/analysis/*.csv
+/MuCiRAG/analysis/*.png
+/MuCiRAG/analysis/*.svg
+/MuCiRAG/analysis/*.eps
+**/mlruns/
+**/mlartifacts/
+**/wandb/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.npy
+*.npz
+*.pth
+
+# Python environments and caches
+**/.venv/
 **/__pycache__/
 *.py[cod]
-
-# Local credentials and runtime data
-.env
-*.toml
-!/newbaseline/pyproject.toml
-!/newbaseline/config.toml
-/Telco-RAG_api/*
-/Telco-RAG_api/3GPP-Release18/
-/Telco-RAG_api/
-/Telco-RAG_api/.venv/
-/Telco-RAG_api/datasets/
-/Telco-RAG_api/results/
-/Telco-RAG_api/output.json
-/dataset/
-/Telco-RAG_api/frontend/node_modules/
-/Telco-RAG_api/frontend/.next/
-/Telco-RAG_api/frontend/out/
-/Telco-RAG_api/frontend/.env*.local
-/Telco-RAG_api/frontend/next-env.d.ts
-
-# New baseline local runtime
-/newbaseline/.venv/
-/newbaseline/resources/
-/newbaseline/results/
-/newbaseline/mlflow.db
-/newbaseline/mlruns/
-/wandb/
-
-# Misc
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
 .DS_Store
-*.pem
-/newbaseline/results/
+
+# Local tests and agent tooling
+**/tests/
+**/test/
+**/test_*.py
+**/*_test.py
+**/.codegraph/
+**/.codex/
+**/.agents/
