@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterable
 from pathlib import Path
 
 LEXICAL_INDEX_SCHEMA_VERSION = 1
@@ -65,8 +64,8 @@ class SqliteBm25Index:
     def __init__(self, path: Path) -> None:
         if not path.is_file():
             raise FileNotFoundError(
-                f"Hybrid retrieval requires {path}. Build it with "
-                "`uv run scripts/build_lexical_index.py`."
+                f"Hybrid retrieval requires {path}. Download the prepared resources with "
+                "`uv run --project MuCiRAG python mucirag.py assets download` from the repository root."
             )
         self.path = path
 
@@ -113,53 +112,3 @@ class SqliteBm25Index:
         with sqlite3.connect(uri, uri=True) as connection:
             rows = connection.execute(sql, [query, *unique_chunk_ids]).fetchall()
         return [(str(chunk_id), float(score)) for chunk_id, score in rows]
-
-
-def build_bm25_index(
-    path: Path,
-    rows: Iterable[tuple[str, str, int, str, str]],
-) -> int:
-    """Build an FTS5 index from `(chunk_id, series, metadata_index, heading, text)` rows."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        raise FileExistsError(f"Refusing to overwrite existing lexical index: {path}")
-    inserted = 0
-    try:
-        with sqlite3.connect(path) as connection:
-            connection.execute("PRAGMA journal_mode=OFF")
-            connection.execute("PRAGMA synchronous=OFF")
-            connection.execute(
-                """
-                CREATE VIRTUAL TABLE chunks USING fts5(
-                    chunk_id UNINDEXED,
-                    series UNINDEXED,
-                    metadata_index UNINDEXED,
-                    heading,
-                    text,
-                    tokenize='unicode61 remove_diacritics 2'
-                )
-                """
-            )
-            batch: list[tuple[str, str, int, str, str]] = []
-            for row in rows:
-                batch.append(row)
-                if len(batch) < 1_000:
-                    continue
-                connection.executemany(
-                    "INSERT INTO chunks(chunk_id, series, metadata_index, heading, text) VALUES (?, ?, ?, ?, ?)",
-                    batch,
-                )
-                inserted += len(batch)
-                batch.clear()
-            if batch:
-                connection.executemany(
-                    "INSERT INTO chunks(chunk_id, series, metadata_index, heading, text) VALUES (?, ?, ?, ?, ?)",
-                    batch,
-                )
-                inserted += len(batch)
-            connection.execute(f"PRAGMA user_version={LEXICAL_INDEX_SCHEMA_VERSION}")
-            connection.execute("INSERT INTO chunks(chunks) VALUES ('optimize')")
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
-    return inserted

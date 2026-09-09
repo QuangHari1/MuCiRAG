@@ -83,3 +83,6 @@
 /MuCiRAG/scripts/build_lexical_index.py
 /MuCiRAG/scripts/build_release18_vocabulary.py
 /MuCiRAG/scripts/run_offline_pipeline.py
+
+# Local source discovery and artifact builders; runtime loads prepared resources
+/MuCiRAG/src/corpus/

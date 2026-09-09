@@ -48,6 +48,10 @@ Các script tạo artifacts dưới đây chỉ giữ local và được ignore 
 Bản checkout công bố dùng tài nguyên đã pin trên Hugging Face; chỉ
 `manage_assets.py` và benchmark runner được giữ trong `scripts/`.
 
+`src/corpus/` cũng chỉ giữ local: `sources.py` tìm tài liệu nguồn,
+`anchor_descriptions.py` tạo mô tả hierarchy, và `lexical_builder.py` tạo BM25.
+Các module trong `src/rag/` chỉ đọc và sử dụng những artifacts này.
+
 Các script local được chia theo nhiệm vụ:
 
 | Nhóm | Script |

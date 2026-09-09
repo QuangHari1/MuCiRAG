@@ -11,7 +11,7 @@ import numpy as np
 
 from .anchor_hierarchy import AnchorHierarchy, normalize_vector
 from .citation_expansion import CitationExpander
-from .lexical import SqliteBm25Index, build_bm25_index
+from .lexical import SqliteBm25Index
 from .types import CitationPath, RetrievalHit
 from .ranking import (
     HYBRID_CANDIDATE_MULTIPLIER,
@@ -319,27 +319,6 @@ class EmbeddingCorpus:
     # Keep these helpers available to existing analysis code.
     _fuse_ranked_hits = staticmethod(fuse_ranked_hits)
     _validate_rrf_weights = staticmethod(validate_rrf_weights)
-
-    def build_lexical_index(self, output_path: Path) -> int:
-        """Build the persistent BM25 index aligned to embedding metadata rows."""
-        def rows():
-            for series, record in self._series.items():
-                metadata_rows = self._load_metadata(record["metadata_file"])
-                for metadata_index, metadata in enumerate(metadata_rows):
-                    chunk = self._source_chunk(record["chunk_file"], metadata)
-                    chunk_id = metadata.get("chunk_id")
-                    if not isinstance(chunk_id, str) or not isinstance(chunk.get("text"), str):
-                        continue
-                    heading = chunk.get("heading")
-                    yield (
-                        chunk_id,
-                        series,
-                        metadata_index,
-                        heading if isinstance(heading, str) else "",
-                        chunk["text"],
-                    )
-
-        return build_bm25_index(output_path, rows())
 
     def search_many(
         self, selected_series: list[str], query_embeddings: np.ndarray, top_k: int
